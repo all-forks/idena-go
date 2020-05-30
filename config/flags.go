@@ -1,33 +1,35 @@
 package config
 
-import "gopkg.in/urfave/cli.v1"
+import "github.com/urfave/cli"
 
 const (
-	DefaultDataDir        = "datadir"
-	DefaultPort           = 40404
-	DefaultRpcHost        = "localhost"
-	DefaultRpcPort        = 9009
-	DefaultIpfsDataDir    = "ipfs"
-	DefaultIpfsPort       = 40405
-	DefaultGodAddress     = "0x4d60dc6a2cba8c3ef1ba5e1eba5c12c54cee6b61"
-	DefaultCeremonyTime   = int64(1567171800)
-	DefaultSwarmKey       = "9ad6f96bb2b02a7308ad87938d6139a974b550cc029ce416641a60c46db2f530"
-	DefaultForceFullSync  = 100
-	DefaultStoreCertRange = 2000
-	DefaultMaxPeers       = 25
-	DefaultBurntTxRange   = 180
+	DefaultDataDir          = "datadir"
+	DefaultPort             = 40404
+	DefaultRpcHost          = "localhost"
+	DefaultRpcPort          = 9009
+	DefaultIpfsDataDir      = "ipfs"
+	DefaultIpfsPort         = 40405
+	DefaultGodAddress       = "0x4d60dc6a2cba8c3ef1ba5e1eba5c12c54cee6b61"
+	DefaultCeremonyTime     = int64(1567171800)
+	DefaultSwarmKey         = "9ad6f96bb2b02a7308ad87938d6139a974b550cc029ce416641a60c46db2f530"
+	DefaultForceFullSync    = 100
+	DefaultStoreCertRange   = 2000
+	DefaultMaxInboundPeers  = 12
+	DefaultMaxOutboundPeers = 6
+	DefaultBurntTxRange     = 180
 
-	LowPowerMaxPeers = 8
+	LowPowerMaxInboundPeers  = 6
+	LowPowerMaxOutboundPeers = 3
 )
 
 var (
-	DefaultBootstrapNodes = []string{
-		"enode://56b1f1fb9ebf3c83d049083b6ceba87a37036176c250beabec6f93f746ff4e70cd7470e0c9431ea793dea9d1f5ad25039c94a6600ff609e85b5713f6163ab326@206.81.23.186:40404",
-		"enode://cec6377ad9bbf60794e7c38f673312c22b4baf831603f17e8a2fe40bb81824b281d20c39f3cb948ec908be6eb1c662366dfd538941382d2d50f29d84bc089b69@165.227.91.202:40404",
-	}
 	DefaultIpfsBootstrapNodes = []string{
 		"/ip4/206.81.23.186/tcp/40403/ipfs/QmTHDLnNMAp6K8txLmJW6EHUbwoHTGhkEUBCp4gAtpNqKY",
 		"/ip4/165.227.91.202/tcp/40403/ipfs/QmZ9VnVZsokXEttRYiHbHmCUBSdzSQywjj5wM3Me96XoVD",
+		"/ip4/167.172.106.202/tcp/40405/ipfs/Qma1F1LXHGA1RLuBDN66nuZE8Pm1249UTX7Q6CbhFnfTG2",
+		"/ip4/104.248.248.29/tcp/40405/ipfs/QmTzKWYksgjm8aecWAJC5pAMidkhWjj86R9MdGA8dVJxQc",
+		"/ip4/161.35.18.60/tcp/40405/ipfs/QmaBWm6dXsc6Y1MZ1x4ZTqHdjy32PGmyGmNPmHnxGGgrXF",
+		"/ip4/35.184.126.97/tcp/40405/ipfs/QmYEM7yPRHBUyzNJvdL34ut2uyJSAk66AeZXzu3Cftofec",
 	}
 	CfgFileFlag = cli.StringFlag{
 		Name:  "config",
@@ -105,5 +107,14 @@ var (
 	ApiKeyFlag = cli.StringFlag{
 		Name:  "apikey",
 		Usage: "Set RPC api key",
+	}
+	LogFileSizeFlag = cli.IntFlag{
+		Name:  "logfilesize",
+		Usage: "Set log file size in KB",
+		Value: 1024 * 10,
+	}
+	LogColoring = cli.BoolFlag{
+		Name:  "logcoloring",
+		Usage: "Use log coloring",
 	}
 )

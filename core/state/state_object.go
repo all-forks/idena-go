@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/math"
@@ -13,17 +14,30 @@ import (
 type IdentityState uint8
 
 const (
-	Undefined           IdentityState = 0
-	Invite              IdentityState = 1
-	Candidate           IdentityState = 2
-	Verified            IdentityState = 3
-	Suspended           IdentityState = 4
-	Killed              IdentityState = 5
-	Zombie              IdentityState = 6
-	Newbie              IdentityState = 7
-	MaxInvitesAmount                  = math.MaxUint8
-	EmptyBlocksBitsSize               = 25
+	Undefined IdentityState = 0
+	Invite    IdentityState = 1
+	Candidate IdentityState = 2
+	Verified  IdentityState = 3
+	Suspended IdentityState = 4
+	Killed    IdentityState = 5
+	Zombie    IdentityState = 6
+	Newbie    IdentityState = 7
+	Human     IdentityState = 8
+
+	MaxInvitesAmount    = math.MaxUint8
+	EmptyBlocksBitsSize = 25
+
+	AdditionalVerifiedFlips = 1
+	AdditionalHumanFlips    = 2
 )
+
+func (s IdentityState) NewbieOrBetter() bool {
+	return s == Newbie || s == Verified || s == Human
+}
+
+func (s IdentityState) VerifiedOrBetter() bool {
+	return s == Verified || s == Human
+}
 
 // stateAccount represents an Idena account which is being modified.
 //
@@ -58,6 +72,11 @@ type stateGlobal struct {
 
 	onDirty func() // Callback method to mark a state object newly dirty
 }
+type stateStatusSwitch struct {
+	data IdentityStatusSwitch
+
+	onDirty func()
+}
 
 type ValidationPeriod uint32
 
@@ -68,6 +87,10 @@ const (
 	LongSessionPeriod      ValidationPeriod = 3
 	AfterLongSessionPeriod ValidationPeriod = 4
 )
+
+type IdentityStatusSwitch struct {
+	Addresses []common.Address `rlp:"nil"`
+}
 
 type Global struct {
 	Epoch                uint16
@@ -80,6 +103,7 @@ type Global struct {
 	FeePerByte           *big.Int
 	VrfProposerThreshold uint64
 	EmptyBlocksBits      *big.Int
+	GodAddressInvites    uint16
 }
 
 // Account is the Idena consensus representation of accounts.
@@ -95,6 +119,14 @@ type IdentityFlip struct {
 	Pair uint8
 }
 
+type ValidationStatusFlag uint16
+
+const (
+	AtLeastOneFlipReported ValidationStatusFlag = 1 << iota
+	AtLeastOneFlipNotQualified
+	AllFlipsNotQualified
+)
+
 type Identity struct {
 	ProfileHash    []byte `rlp:"nil"`
 	Stake          *big.Int
@@ -103,15 +135,17 @@ type Identity struct {
 	State          IdentityState
 	QualifiedFlips uint32
 	// should use GetShortFlipPoints instead of reading directly
-	ShortFlipPoints uint32
-	PubKey          []byte `rlp:"nil"`
-	RequiredFlips   uint8
-	Flips           []IdentityFlip `rlp:"nil"`
-	Generation      uint32
-	Code            []byte   `rlp:"nil"`
-	Invitees        []TxAddr `rlp:"nil"`
-	Inviter         *TxAddr  `rlp:"nil"`
-	Penalty         *big.Int
+	ShortFlipPoints      uint32
+	PubKey               []byte `rlp:"nil"`
+	RequiredFlips        uint8
+	Flips                []IdentityFlip `rlp:"nil"`
+	Generation           uint32
+	Code                 []byte   `rlp:"nil"`
+	Invitees             []TxAddr `rlp:"nil"`
+	Inviter              *TxAddr  `rlp:"nil"`
+	Penalty              *big.Int
+	ValidationTxsBits    byte
+	LastValidationStatus ValidationStatusFlag
 }
 
 type TxAddr struct {
@@ -123,6 +157,13 @@ func (i *Identity) GetShortFlipPoints() float32 {
 	return float32(i.ShortFlipPoints) / 2
 }
 
+func (i *Identity) GetTotalScore() float32 {
+	if i.QualifiedFlips == 0 {
+		return 0
+	}
+	return i.GetShortFlipPoints() / float32(i.QualifiedFlips)
+}
+
 func (i *Identity) HasDoneAllRequiredFlips() bool {
 	return uint8(len(i.Flips)) >= i.RequiredFlips
 }
@@ -131,13 +172,23 @@ func (i *Identity) GetTotalWordPairsCount() int {
 	return common.WordPairsPerFlip * int(i.RequiredFlips)
 }
 
+func (i *Identity) GetMaximumAvailableFlips() uint8 {
+	if i.State == Verified {
+		return i.RequiredFlips + AdditionalVerifiedFlips
+	}
+	if i.State == Human {
+		return i.RequiredFlips + AdditionalHumanFlips
+	}
+	return i.RequiredFlips
+}
+
 type ApprovedIdentity struct {
 	Approved bool
 	Online   bool
 }
 
 // newAccountObject creates a state object.
-func newAccountObject(db *StateDB, address common.Address, data Account, onDirty func(addr common.Address)) *stateAccount {
+func newAccountObject(address common.Address, data Account, onDirty func(addr common.Address)) *stateAccount {
 	if data.Balance == nil {
 		data.Balance = new(big.Int)
 	}
@@ -150,7 +201,7 @@ func newAccountObject(db *StateDB, address common.Address, data Account, onDirty
 }
 
 // newAccountObject creates a state object.
-func newIdentityObject(db *StateDB, address common.Address, data Identity, onDirty func(addr common.Address)) *stateIdentity {
+func newIdentityObject(address common.Address, data Identity, onDirty func(addr common.Address)) *stateIdentity {
 
 	return &stateIdentity{
 		address: address,
@@ -160,14 +211,21 @@ func newIdentityObject(db *StateDB, address common.Address, data Identity, onDir
 }
 
 // newGlobalObject creates a global state object.
-func newGlobalObject(db *StateDB, data Global, onDirty func()) *stateGlobal {
-
+func newGlobalObject(data Global, onDirty func()) *stateGlobal {
 	return &stateGlobal{
 		data:    data,
 		onDirty: onDirty,
 	}
 }
-func newApprovedIdentityObject(db *IdentityStateDB, address common.Address, data ApprovedIdentity, onDirty func(addr common.Address)) *stateApprovedIdentity {
+
+func newStatusSwitchObject(data IdentityStatusSwitch, onDirty func()) *stateStatusSwitch {
+	return &stateStatusSwitch{
+		data:    data,
+		onDirty: onDirty,
+	}
+}
+
+func newApprovedIdentityObject(address common.Address, data ApprovedIdentity, onDirty func(addr common.Address)) *stateApprovedIdentity {
 	return &stateApprovedIdentity{
 		address: address,
 		data:    data,
@@ -219,14 +277,11 @@ func (s *stateAccount) setBalance(amount *big.Int) {
 		s.data.Balance = new(big.Int)
 	}
 	s.data.Balance = amount
-	if s.onDirty != nil {
-		s.onDirty(s.Address())
-		s.onDirty = nil
-	}
+	s.touch()
 }
 
 func (s *stateAccount) deepCopy(db *StateDB, onDirty func(addr common.Address)) *stateAccount {
-	stateObject := newAccountObject(db, s.address, s.data, onDirty)
+	stateObject := newAccountObject(s.address, s.data, onDirty)
 	stateObject.deleted = s.deleted
 	return stateObject
 }
@@ -345,6 +400,17 @@ func (s *stateIdentity) AddStake(amount *big.Int) {
 	s.SetStake(new(big.Int).Add(s.Stake(), amount))
 }
 
+func (s *stateIdentity) SubStake(amount *big.Int) {
+	if amount.Sign() == 0 {
+		if s.empty() {
+			s.touch()
+		}
+		return
+	}
+
+	s.SetStake(new(big.Int).Sub(s.Stake(), amount))
+}
+
 func (s *stateIdentity) SetStake(amount *big.Int) {
 	if s.data.Stake == nil {
 		s.data.Stake = new(big.Int)
@@ -407,6 +473,17 @@ func (s *stateIdentity) AddFlip(cid []byte, pair uint8) {
 			Pair: pair,
 		})
 		s.touch()
+	}
+}
+
+func (s *stateIdentity) DeleteFlip(cid []byte) {
+	for i, flip := range s.data.Flips {
+		if bytes.Compare(flip.Cid, cid) != 0 {
+			continue
+		}
+		s.data.Flips = append(s.data.Flips[:i], s.data.Flips[i+1:]...)
+		s.touch()
+		return
 	}
 }
 
@@ -494,6 +571,33 @@ func (s *stateIdentity) GetProfileHash() []byte {
 	return s.data.ProfileHash
 }
 
+func (s *stateIdentity) SetValidationTxBit(txType types.TxType) {
+	mask := validationTxBitMask(txType)
+	if mask == 0 {
+		return
+	}
+	s.data.ValidationTxsBits = s.data.ValidationTxsBits | mask
+	s.touch()
+}
+
+func (s *stateIdentity) HasValidationTx(txType types.TxType) bool {
+	mask := validationTxBitMask(txType)
+	if mask == 0 {
+		return false
+	}
+	return s.data.ValidationTxsBits&mask > 0
+}
+
+func (s *stateIdentity) ResetValidationTxBits() {
+	s.data.ValidationTxsBits = 0
+	s.touch()
+}
+
+func (s *stateIdentity) SetValidationStatus(status ValidationStatusFlag) {
+	s.data.LastValidationStatus = status
+	s.touch()
+}
+
 // EncodeRLP implements rlp.Encoder.
 func (s *stateGlobal) EncodeRLP(w io.Writer) error {
 	return rlp.Encode(w, s.data)
@@ -533,14 +637,14 @@ func (s *stateGlobal) AddBlockBit(empty bool) {
 	s.touch()
 }
 
-func (s *stateGlobal) EmptyBlocksRatio() float64 {
+func (s *stateGlobal) EmptyBlocksCount() int {
 	cnt := 0
 	for i := 0; i < EmptyBlocksBitsSize; i++ {
 		if s.data.EmptyBlocksBits.Bit(i) == 0 {
 			cnt++
 		}
 	}
-	return float64(cnt) / float64(EmptyBlocksBitsSize)
+	return cnt
 }
 
 func (s *stateGlobal) EmptyBlocksBits() *big.Int {
@@ -621,6 +725,20 @@ func (s *stateGlobal) FeePerByte() *big.Int {
 	return s.data.FeePerByte
 }
 
+func (s *stateGlobal) SubGodAddressInvite() {
+	s.data.GodAddressInvites -= 1
+	s.touch()
+}
+
+func (s *stateGlobal) GodAddressInvites() uint16 {
+	return s.data.GodAddressInvites
+}
+
+func (s *stateGlobal) SetGodAddressInvites(count uint16) {
+	s.data.GodAddressInvites = count
+	s.touch()
+}
+
 // EncodeRLP implements rlp.Encoder.
 func (s *stateApprovedIdentity) EncodeRLP(w io.Writer) error {
 	return rlp.Encode(w, s.data)
@@ -658,7 +776,50 @@ func (s *stateApprovedIdentity) SetOnline(online bool) {
 
 func IsCeremonyCandidate(identity Identity) bool {
 	state := identity.State
-	return (state == Candidate || state == Newbie ||
-		state == Verified || state == Suspended ||
+	return (state == Candidate || state.NewbieOrBetter() || state == Suspended ||
 		state == Zombie) && identity.HasDoneAllRequiredFlips()
+}
+
+// EncodeRLP implements rlp.Encoder.
+func (s *stateStatusSwitch) EncodeRLP(w io.Writer) error {
+	return rlp.Encode(w, s.data)
+}
+
+func (s *stateStatusSwitch) Addresses() []common.Address {
+	return s.data.Addresses
+}
+
+func (s *stateStatusSwitch) Clear() {
+	s.data.Addresses = nil
+	s.touch()
+}
+
+func (s *stateStatusSwitch) ToggleAddress(sender common.Address) {
+	defer s.touch()
+	for i := 0; i < len(s.data.Addresses); i++ {
+		if s.data.Addresses[i] == sender {
+			s.data.Addresses = append(s.data.Addresses[:i], s.data.Addresses[i+1:]...)
+			return
+		}
+	}
+	s.data.Addresses = append(s.data.Addresses, sender)
+}
+
+func (s *stateStatusSwitch) HasAddress(addr common.Address) bool {
+	for _, item := range s.data.Addresses {
+		if item == addr {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *stateStatusSwitch) touch() {
+	if s.onDirty != nil {
+		s.onDirty()
+	}
+}
+
+func (f ValidationStatusFlag) HasFlag(flag ValidationStatusFlag) bool {
+	return f&flag != 0
 }

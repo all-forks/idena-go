@@ -5,7 +5,7 @@ import (
 	"github.com/idena-network/idena-go/config"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/node"
-	"gopkg.in/urfave/cli.v1"
+	"github.com/urfave/cli"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -46,17 +46,20 @@ func main() {
 		config.ProfileFlag,
 		config.IpfsPortStaticFlag,
 		config.ApiKeyFlag,
+		config.LogFileSizeFlag,
+		config.LogColoring,
 	}
 
 	app.Action = func(context *cli.Context) error {
-		logLvl := log.Lvl(context.Int("verbosity"))
+		logLvl := log.Lvl(context.Int(config.VerbosityFlag.Name))
+		logFileSize := context.Int(config.LogFileSizeFlag.Name)
 
-		var handler log.Handler
+		useLogColor := true
 		if runtime.GOOS == "windows" {
-			handler = log.LvlFilterHandler(logLvl, log.StreamHandler(os.Stdout, log.LogfmtFormat()))
-		} else {
-			handler = log.LvlFilterHandler(logLvl, log.StreamHandler(os.Stderr, log.TerminalFormat(true)))
+			useLogColor = context.Bool(config.LogColoring.Name)
 		}
+
+		handler := log.LvlFilterHandler(logLvl, log.StreamHandler(os.Stdout, log.TerminalFormat(useLogColor)))
 
 		log.Root().SetHandler(handler)
 
@@ -71,7 +74,7 @@ func main() {
 			return err
 		}
 
-		fileHandler, err := getLogFileHandler(cfg)
+		fileHandler, err := getLogFileHandler(cfg, logFileSize)
 
 		if err != nil {
 			return err
@@ -96,7 +99,7 @@ func main() {
 	}
 }
 
-func getLogFileHandler(cfg *config.Config) (log.Handler, error) {
+func getLogFileHandler(cfg *config.Config, logFileSize int) (log.Handler, error) {
 	path := filepath.Join(cfg.DataDir, LogDir)
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		if err := os.MkdirAll(path, 0755); err != nil {
@@ -104,7 +107,7 @@ func getLogFileHandler(cfg *config.Config) (log.Handler, error) {
 		}
 	}
 
-	fileHandler, _ := log.FileHandler(filepath.Join(path, "output.log"), log.TerminalFormat(false))
+	fileHandler, _ := log.RotatingFileHandler(filepath.Join(path, "output.log"), uint(logFileSize*1024), log.TerminalFormat(false))
 
 	return fileHandler, nil
 }

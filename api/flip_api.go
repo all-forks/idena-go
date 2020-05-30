@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"github.com/idena-network/idena-go/blockchain/attachments"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
@@ -34,18 +35,28 @@ type FlipSubmitResponse struct {
 }
 
 type FlipSubmitArgs struct {
-	Hex    *hexutil.Bytes `json:"hex"`
-	PairId uint8          `json:"pairId"`
+	Hex        *hexutil.Bytes `json:"hex"`
+	PublicHex  *hexutil.Bytes `json:"publicHex"`
+	PrivateHex *hexutil.Bytes `json:"privateHex"`
+	PairId     uint8          `json:"pairId"`
 }
 
 func (api *FlipApi) Submit(args FlipSubmitArgs) (FlipSubmitResponse, error) {
-	if args.Hex == nil {
+	if args.Hex == nil && args.PublicHex == nil {
 		return FlipSubmitResponse{}, errors.New("flip is empty")
 	}
 
-	rawFlip := *args.Hex
+	var rawPublicPart, rawPrivatePart []byte
+	if args.PublicHex != nil {
+		rawPublicPart = *args.PublicHex
+	} else {
+		rawPublicPart = *args.Hex
+	}
+	if args.PrivateHex != nil {
+		rawPrivatePart = *args.PrivateHex
+	}
 
-	cid, encryptedFlip, err := api.fp.PrepareFlip(rawFlip)
+	cid, encryptedPublicPart, encryptedPrivatePart, err := api.fp.PrepareFlip(rawPublicPart, rawPrivatePart)
 
 	if err != nil {
 		return FlipSubmitResponse{}, err
@@ -55,23 +66,44 @@ func (api *FlipApi) Submit(args FlipSubmitArgs) (FlipSubmitResponse, error) {
 
 	tx, err := api.baseApi.getSignedTx(addr, nil, types.SubmitFlipTx, decimal.Zero, decimal.Zero, decimal.Zero, 0, 0, attachments.CreateFlipSubmitAttachment(cid.Bytes(), args.PairId), nil)
 
+	log.Info("Building new flip tx", "hash", tx.Hash().Hex(), "nonce", tx.AccountNonce, "epoch", tx.Epoch)
+
 	if err != nil {
 		return FlipSubmitResponse{}, err
 	}
 
 	flip := &types.Flip{
-		Tx:   tx,
-		Data: encryptedFlip,
+		Tx:          tx,
+		PublicPart:  encryptedPublicPart,
+		PrivatePart: encryptedPrivatePart,
 	}
 
 	if err := api.fp.AddNewFlip(flip, true); err != nil {
 		return FlipSubmitResponse{}, err
 	}
-	log.Info("flip submitted", "hash", tx.Hash(), "nonce", tx.AccountNonce)
+
+	log.Info("Flip submitted", "hash", tx.Hash().Hex())
+
 	return FlipSubmitResponse{
 		TxHash: tx.Hash(),
 		Hash:   cid.String(),
 	}, nil
+}
+
+func (api *FlipApi) Delete(ctx context.Context, hash string) (common.Hash, error) {
+	c, err := cid.Decode(hash)
+	if err != nil {
+		return common.Hash{}, errors.New("invalid flip hash")
+	}
+	cidBytes := c.Bytes()
+	addr := api.baseApi.getCurrentCoinbase()
+
+	if txHash, err := api.baseApi.sendTx(ctx, addr, nil, types.DeleteFlipTx, decimal.Zero, decimal.Zero, decimal.Zero,
+		0, 0, attachments.CreateDeleteFlipAttachment(cidBytes), nil); err != nil {
+		return common.Hash{}, err
+	} else {
+		return txHash, nil
+	}
 }
 
 type FlipHashesResponse struct {
@@ -86,6 +118,9 @@ func (api *FlipApi) isCeremonyCandidate() bool {
 }
 
 func (api *FlipApi) ShortHashes() ([]FlipHashesResponse, error) {
+	log.Info("short hashes request")
+	defer log.Info("short hashes response")
+
 	period := api.baseApi.getAppState().State.ValidationPeriod()
 
 	if period != state.FlipLotteryPeriod && period != state.ShortSessionPeriod {
@@ -102,6 +137,9 @@ func (api *FlipApi) ShortHashes() ([]FlipHashesResponse, error) {
 }
 
 func (api *FlipApi) LongHashes() ([]FlipHashesResponse, error) {
+	log.Info("long hashes request")
+	defer log.Info("long hashes response")
+
 	period := api.baseApi.getAppState().State.ValidationPeriod()
 
 	if period != state.FlipLotteryPeriod && period != state.ShortSessionPeriod && period != state.LongSessionPeriod {
@@ -140,24 +178,29 @@ func prepareHashes(flipper *flip.Flipper, flips [][]byte, shortSession bool) ([]
 }
 
 type FlipResponse struct {
-	Hex hexutil.Bytes `json:"hex"`
+	Hex        hexutil.Bytes `json:"hex"`
+	PrivateHex hexutil.Bytes `json:"privateHex"`
 }
 
 func (api *FlipApi) Get(hash string) (FlipResponse, error) {
+	log.Info("get flip request", "hash", hash)
+	defer log.Info("get flip response", "hash", hash)
+
 	c, err := cid.Decode(hash)
 	if err != nil {
 		return FlipResponse{}, err
 	}
 	cidBytes := c.Bytes()
 
-	data, err := api.fp.GetFlip(cidBytes)
+	publicPart, privatePart, err := api.fp.GetFlip(cidBytes)
 
 	if err != nil {
 		return FlipResponse{}, err
 	}
 
 	return FlipResponse{
-		Hex: hexutil.Bytes(data),
+		Hex:        publicPart,
+		PrivateHex: privatePart,
 	}, nil
 }
 
@@ -178,6 +221,9 @@ type SubmitAnswersResponse struct {
 }
 
 func (api *FlipApi) SubmitShortAnswers(args SubmitAnswersArgs) (SubmitAnswersResponse, error) {
+	log.Info("short answers submitting request")
+	defer log.Info("short answers submitting response")
+
 	if !api.isCeremonyCandidate() {
 		return SubmitAnswersResponse{}, errors.New("coinbase address is not a ceremony candidate")
 	}
@@ -198,6 +244,9 @@ func (api *FlipApi) SubmitShortAnswers(args SubmitAnswersArgs) (SubmitAnswersRes
 }
 
 func (api *FlipApi) SubmitLongAnswers(args SubmitAnswersArgs) (SubmitAnswersResponse, error) {
+	log.Info("long answers submitting request")
+	defer log.Info("long answers submitting response")
+
 	if !api.isCeremonyCandidate() {
 		return SubmitAnswersResponse{}, errors.New("coinbase address is not a ceremony candidate")
 	}

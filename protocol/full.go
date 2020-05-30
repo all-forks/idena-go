@@ -9,18 +9,21 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/log"
+	"github.com/idena-network/idena-go/stats/collector"
+	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/pkg/errors"
 	"time"
 )
 
 const FullSyncBatchSize = 200
+const FlushToDiskLastStates = 200
 
 var (
 	BlockCertIsMissing = errors.New("block cert is missing")
 )
 
 type fullSync struct {
-	pm                   *ProtocolManager
+	pm                   *IdenaGossipHandler
 	log                  log.Logger
 	chain                *blockchain.Blockchain
 	batches              chan *batch
@@ -29,17 +32,24 @@ type fullSync struct {
 	appState             *appstate.AppState
 	potentialForkedPeers mapset.Set
 	deferredHeaders      []blockPeer
+	targetHeight         uint64
+	statsCollector       collector.StatsCollector
 }
 
 func (fs *fullSync) batchSize() uint64 {
 	return FullSyncBatchSize
 }
 
-func NewFullSync(pm *ProtocolManager, log log.Logger,
+func NewFullSync(
+	pm *IdenaGossipHandler,
+	log log.Logger,
 	chain *blockchain.Blockchain,
 	ipfs ipfs.Proxy,
 	appState *appstate.AppState,
-	potentialForkedPeers mapset.Set) *fullSync {
+	potentialForkedPeers mapset.Set,
+	targetHeight uint64,
+	statsCollector collector.StatsCollector,
+) *fullSync {
 
 	return &fullSync{
 		appState:             appState,
@@ -50,24 +60,9 @@ func NewFullSync(pm *ProtocolManager, log log.Logger,
 		pm:                   pm,
 		isSyncing:            true,
 		ipfs:                 ipfs,
+		targetHeight:         targetHeight,
+		statsCollector:       statsCollector,
 	}
-}
-
-func (fs *fullSync) requestBatch(from, to uint64, ignoredPeer string) *batch {
-	knownHeights := fs.pm.GetKnownHeights()
-	if knownHeights == nil {
-		return nil
-	}
-	for peerId, height := range knownHeights {
-		if (peerId != ignoredPeer || len(knownHeights) == 1) && height >= to {
-			if batch, err := fs.pm.GetBlocksRange(peerId, from, to); err != nil {
-				continue
-			} else {
-				return batch
-			}
-		}
-	}
-	return nil
 }
 
 func (fs *fullSync) applyDeferredBlocks(checkState *appstate.AppState) (uint64, error) {
@@ -80,7 +75,13 @@ func (fs *fullSync) applyDeferredBlocks(checkState *appstate.AppState) (uint64, 
 			fs.log.Error("fail to retrieve block", "err", err)
 			return b.Header.Height(), err
 		} else {
-			if err := fs.chain.AddBlock(block, checkState); err != nil {
+
+			/*if fs.targetHeight-b.Header.Height() <= FlushToDiskLastStates {
+				if err := fs.appState.UseDefaultTree(); err != nil {
+					return block.Height(), errors.Wrap(err, "cannot switch state tree to defaults")
+				}
+			}*/
+			if err := fs.chain.AddBlock(block, checkState, fs.statsCollector); err != nil {
 				if err := fs.appState.ResetTo(fs.chain.Head.Height()); err != nil {
 					return block.Height(), err
 				}
@@ -102,7 +103,20 @@ func (fs *fullSync) applyDeferredBlocks(checkState *appstate.AppState) (uint64, 
 	return 0, nil
 }
 
+func (fs *fullSync) preConsuming(head *types.Header) (uint64, error) {
+	/*if fs.targetHeight-head.Height() > FlushToDiskLastStates {
+		fs.log.Info("switch sync tree to fast version")
+		if err := fs.appState.UseSyncTree(); err != nil {
+			return 0, errors.Wrap(err, "cannot switch state tree to sync tree")
+		}
+	}*/
+	return head.Height() + 1, nil
+}
+
 func (fs *fullSync) postConsuming() error {
+	/*if err := fs.appState.UseDefaultTree(); err != nil {
+		return err
+	}*/
 	if len(fs.deferredHeaders) > 0 {
 		fs.log.Warn(fmt.Sprintf("All blocks was consumed but last headers have not been added to chain"))
 	}
@@ -115,10 +129,13 @@ func (fs *fullSync) processBatch(batch *batch, attemptNum int) error {
 		return errors.New("number of attempts exceeded limit")
 	}
 
-	checkState, _ := fs.appState.ForCheckWithNewCache(fs.chain.Head.Height())
+	checkState, err := fs.appState.ForCheckWithOverwrite(fs.chain.Head.Height())
+	if err != nil {
+		return err
+	}
 
 	reload := func(from uint64) error {
-		b := fs.requestBatch(from, batch.to, batch.p.id)
+		b := requestBatch(fs.pm, from, batch.to, batch.p.id)
 		if b == nil {
 			return errors.New(fmt.Sprintf("Batch (%v-%v) can't be loaded", from, batch.to))
 		}
@@ -146,7 +163,7 @@ func (fs *fullSync) processBatch(batch *batch, attemptNum int) error {
 				return reload(i)
 			}
 			fs.deferredHeaders = append(fs.deferredHeaders, blockPeer{*block, batch.p.id})
-			if block.Cert != nil && block.Cert.Len() > 0 {
+			if block.Cert != nil && !block.Cert.Empty() {
 				if from, err := fs.applyDeferredBlocks(checkState); err != nil {
 					return reload(from)
 				}
@@ -163,11 +180,7 @@ func (fs *fullSync) processBatch(batch *batch, attemptNum int) error {
 	return nil
 }
 
-func (fs *fullSync) preConsuming(head *types.Header) (uint64, error) {
-	return head.Height() + 1, nil
-}
-
-func (fs *fullSync) validateHeader(block *block, p *peer) error {
+func (fs *fullSync) validateHeader(block *block, p *protoPeer) error {
 	prevBlock := fs.chain.Head
 	if len(fs.deferredHeaders) > 0 {
 		prevBlock = fs.deferredHeaders[len(fs.deferredHeaders)-1].Header
@@ -197,7 +210,7 @@ func (fs *fullSync) GetBlock(header *types.Header) (*types.Block, error) {
 			Body:   &types.Body{},
 		}, nil
 	}
-	if txs, err := fs.ipfs.Get(header.ProposedHeader.IpfsHash); err != nil {
+	if txs, err := fs.ipfs.Get(header.ProposedHeader.IpfsHash, ipfs.Block); err != nil {
 		return nil, err
 	} else {
 		if len(txs) > 0 {
@@ -212,7 +225,7 @@ func (fs *fullSync) GetBlock(header *types.Header) (*types.Block, error) {
 	}
 }
 
-func (fs *fullSync) SeekBlocks(fromBlock, toBlock uint64, peers []string) chan *types.BlockBundle {
+func (fs *fullSync) SeekBlocks(fromBlock, toBlock uint64, peers []peer.ID) chan *types.BlockBundle {
 	var batches []*batch
 	blocks := make(chan *types.BlockBundle, len(peers))
 
@@ -252,7 +265,7 @@ func (fs *fullSync) SeekBlocks(fromBlock, toBlock uint64, peers []string) chan *
 	return blocks
 }
 
-func (fs *fullSync) SeekForkedBlocks(ownBlocks []common.Hash, peerId string) chan types.BlockBundle {
+func (fs *fullSync) SeekForkedBlocks(ownBlocks []common.Hash, peerId peer.ID) chan types.BlockBundle {
 	blocks := make(chan types.BlockBundle, 100)
 	batch, err := fs.pm.GetForkBlockRange(peerId, ownBlocks)
 	if err != nil {

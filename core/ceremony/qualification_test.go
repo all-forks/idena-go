@@ -108,8 +108,9 @@ func Test_qualifyCandidate(t *testing.T) {
 
 	flipQualificationMap := make(map[int]FlipQualification)
 	flipQualificationMap[10] = FlipQualification{
-		status: Qualified,
-		answer: types.Left,
+		status:     Qualified,
+		answer:     types.Left,
+		wrongWords: true,
 	}
 	flipQualificationMap[11] = FlipQualification{
 		status: NotQualified,
@@ -186,19 +187,19 @@ func Test_qualifyCandidate(t *testing.T) {
 	}
 
 	// when
-	shortPoint, shortQualifiedFlipsCount, _, _ := q.qualifyCandidate(candidate, flipQualificationMap, shortFlipsToSolve, true, notApprovedFlips)
-	longPoint, longQualifiedFlipsCount, _, _ := q.qualifyCandidate(candidate, flipQualificationMap, longFlipsToSolve, false, notApprovedFlips)
+	shortPoint, shortQualifiedFlipsCount, _, _, _ := q.qualifyCandidate(candidate, flipQualificationMap, shortFlipsToSolve, true, notApprovedFlips)
+	longPoint, longQualifiedFlipsCount, _, _, _ := q.qualifyCandidate(candidate, flipQualificationMap, longFlipsToSolve, false, notApprovedFlips)
 
-	mShortPoint, mShortQualifiedFlipsCount, _, _ := q.qualifyCandidate(maliciousCandidate, flipQualificationMap, shortFlipsToSolve, true, notApprovedFlips)
+	mShortPoint, mShortQualifiedFlipsCount, _, _, _ := q.qualifyCandidate(maliciousCandidate, flipQualificationMap, shortFlipsToSolve, true, notApprovedFlips)
 
 	// then
-	require.Equal(t, float32(3.5), shortPoint)
-	require.Equal(t, uint32(4), shortQualifiedFlipsCount)
+	require.Equal(t, float32(2.5), shortPoint)
+	require.Equal(t, uint32(3), shortQualifiedFlipsCount)
 	require.Equal(t, float32(4.5), longPoint)
 	require.Equal(t, uint32(6), longQualifiedFlipsCount)
 
 	require.Equal(t, float32(0), mShortPoint)
-	require.Equal(t, uint32(5), mShortQualifiedFlipsCount)
+	require.Equal(t, uint32(6), mShortQualifiedFlipsCount)
 }
 
 func Test_qualifyCandidateWithFewFlips(t *testing.T) {
@@ -233,7 +234,7 @@ func Test_qualifyCandidateWithFewFlips(t *testing.T) {
 		},
 		epochDb: epochDb,
 	}
-	shortPoint, shortQualifiedFlipsCount, _, _ := q.qualifyCandidate(candidate, flipQualificationMap, shortFlipsToSolve, true, mapset.NewSet())
+	shortPoint, shortQualifiedFlipsCount, _, _, _ := q.qualifyCandidate(candidate, flipQualificationMap, shortFlipsToSolve, true, mapset.NewSet())
 
 	require.Equal(t, float32(1.5), shortPoint)
 	require.Equal(t, uint32(2), shortQualifiedFlipsCount)
@@ -248,7 +249,7 @@ func Test_qualifyCandidateWithFewFlips(t *testing.T) {
 		},
 		epochDb: epochDb,
 	}
-	shortPoint, shortQualifiedFlipsCount, _, _ = q2.qualifyCandidate(candidate, flipQualificationMap, shortFlipsToSolve, true, mapset.NewSet())
+	shortPoint, shortQualifiedFlipsCount, _, _, _ = q2.qualifyCandidate(candidate, flipQualificationMap, shortFlipsToSolve, true, mapset.NewSet())
 
 	require.Equal(t, float32(0), shortPoint)
 	require.Equal(t, uint32(2), shortQualifiedFlipsCount)

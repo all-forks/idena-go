@@ -27,7 +27,7 @@ type IdentityStateDB struct {
 
 func NewLazyIdentityState(db dbm.DB) *IdentityStateDB {
 	pdb := dbm.NewPrefixDB(db, loadIdentityPrefix(db, false))
-	tree := NewMutableTree(pdb)
+	tree := NewMutableTreeWithOpts(pdb, dbm.NewMemDB(), DefaultTreeKeepEvery, DefaultTreeKeepRecent)
 	return &IdentityStateDB{
 		db:                   pdb,
 		original:             db,
@@ -38,9 +38,9 @@ func NewLazyIdentityState(db dbm.DB) *IdentityStateDB {
 	}
 }
 
-func (s *IdentityStateDB) ForCheck(height uint64) (*IdentityStateDB, error) {
+func (s *IdentityStateDB) ForCheckWithOverwrite(height uint64) (*IdentityStateDB, error) {
 	db := database.NewBackedMemDb(s.db)
-	tree := NewMutableTree(db)
+	tree := NewMutableTreeWithOpts(db, database.NewBackedMemDb(s.tree.RecentDb()), s.tree.KeepEvery(), s.tree.KeepRecent())
 	if _, err := tree.LoadVersionForOverwriting(int64(height)); err != nil {
 		return nil, err
 	}
@@ -55,15 +55,31 @@ func (s *IdentityStateDB) ForCheck(height uint64) (*IdentityStateDB, error) {
 	}, nil
 }
 
-func (s *IdentityStateDB) Readonly(height uint64) (*IdentityStateDB, error) {
+func (s *IdentityStateDB) ForCheck(height uint64) (*IdentityStateDB, error) {
 	db := database.NewBackedMemDb(s.db)
-	tree := NewMutableTree(db)
+	tree := NewMutableTreeWithOpts(db, database.NewBackedMemDb(s.tree.RecentDb()), s.tree.KeepEvery(), s.tree.KeepRecent())
 	if _, err := tree.LoadVersion(int64(height)); err != nil {
 		return nil, err
 	}
 
 	return &IdentityStateDB{
 		db:                   db,
+		original:             s.original,
+		tree:                 tree,
+		stateIdentities:      make(map[common.Address]*stateApprovedIdentity),
+		stateIdentitiesDirty: make(map[common.Address]struct{}),
+		log:                  log.New(),
+	}, nil
+}
+
+func (s *IdentityStateDB) Readonly(height uint64) (*IdentityStateDB, error) {
+	tree := NewMutableTreeWithOpts(s.db, s.tree.RecentDb(), s.tree.KeepEvery(), s.tree.KeepRecent())
+	if _, err := tree.LazyLoad(int64(height)); err != nil {
+		return nil, err
+	}
+
+	return &IdentityStateDB{
+		db:                   s.db,
 		original:             s.original,
 		tree:                 tree,
 		stateIdentities:      make(map[common.Address]*stateApprovedIdentity),
@@ -151,6 +167,8 @@ func (s *IdentityStateDB) CommitTree(newVersion int64) (root []byte, version int
 func (s *IdentityStateDB) Precommit(deleteEmptyObjects bool) *IdentityStateDiff {
 	// Commit identity objects to the trie.
 	diff := new(IdentityStateDiff)
+	s.lock.Lock()
+	defer s.lock.Unlock()
 	for _, addr := range getOrderedObjectsKeys(s.stateIdentitiesDirty) {
 		stateObject := s.stateIdentities[addr]
 		if deleteEmptyObjects && stateObject.empty() {
@@ -178,9 +196,10 @@ func (s *IdentityStateDB) Reset() {
 }
 
 func (s *IdentityStateDB) Clear() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 	s.stateIdentities = make(map[common.Address]*stateApprovedIdentity)
 	s.stateIdentitiesDirty = make(map[common.Address]struct{})
-	s.lock = sync.Mutex{}
 }
 
 // Retrieve a state object or create a new state object if nil
@@ -194,7 +213,7 @@ func (s *IdentityStateDB) GetOrNewIdentityObject(addr common.Address) *stateAppr
 
 func (s *IdentityStateDB) createIdentity(addr common.Address) (newobj, prev *stateApprovedIdentity) {
 	prev = s.getStateIdentity(addr)
-	newobj = newApprovedIdentityObject(s, addr, ApprovedIdentity{}, s.MarkStateIdentityObjectDirty)
+	newobj = newApprovedIdentityObject(addr, ApprovedIdentity{}, s.MarkStateIdentityObjectDirty)
 	newobj.touch()
 	s.setStateIdentityObject(newobj)
 	return newobj, prev
@@ -203,12 +222,15 @@ func (s *IdentityStateDB) createIdentity(addr common.Address) (newobj, prev *sta
 // Retrieve a state account given my the address. Returns nil if not found.
 func (s *IdentityStateDB) getStateIdentity(addr common.Address) (stateObject *stateApprovedIdentity) {
 	// Prefer 'live' objects.
+	s.lock.Lock()
 	if obj := s.stateIdentities[addr]; obj != nil {
+		s.lock.Unlock()
 		if obj.deleted {
 			return nil
 		}
 		return obj
 	}
+	s.lock.Unlock()
 
 	// Load the object from the database.
 	_, enc := s.tree.Get(append(identityPrefix, addr[:]...))
@@ -221,7 +243,7 @@ func (s *IdentityStateDB) getStateIdentity(addr common.Address) (stateObject *st
 		return nil
 	}
 	// Insert into the live set.
-	obj := newApprovedIdentityObject(s, addr, data, s.MarkStateIdentityObjectDirty)
+	obj := newApprovedIdentityObject(addr, data, s.MarkStateIdentityObjectDirty)
 	s.setStateIdentityObject(obj)
 	return obj
 }
@@ -304,6 +326,10 @@ func (s *IdentityStateDB) IterateIdentities(fn func(key []byte, value []byte) bo
 	return s.tree.GetImmutable().IterateRange(nil, nil, true, fn)
 }
 
+func (s *IdentityStateDB) Version() uint64 {
+	return uint64(s.tree.Version())
+}
+
 func (s *IdentityStateDB) AddDiff(height uint64, diff *IdentityStateDiff) {
 	if diff.Empty() {
 		return
@@ -330,39 +356,49 @@ func (s *IdentityStateDB) SaveForcedVersion(height uint64) error {
 	return err
 }
 
-func (s *IdentityStateDB) SwitchToPreliminary(height uint64) error {
+func (s *IdentityStateDB) SwitchToPreliminary(height uint64) (batch dbm.Batch, dropDb dbm.DB, err error) {
+
 	prefix := loadIdentityPrefix(s.original, true)
 	if prefix == nil {
-		return errors.New("preliminary prefix is not found")
+		return nil, nil, errors.New("preliminary prefix is not found")
 	}
 	pdb := dbm.NewPrefixDB(s.original, prefix)
 	tree := NewMutableTree(pdb)
 	if _, err := tree.LoadVersion(int64(height)); err != nil {
-		return err
+		return nil, nil, err
 	}
-	setIdentityPrefix(s.original, prefix, false)
-	setIdentityPrefix(s.original, nil, true)
-	clearDb(s.db)
+
+	batch = s.original.NewBatch()
+	setIdentityPrefix(batch, prefix, false)
+	setIdentityPrefix(batch, nil, true)
+	dropDb = s.db
 
 	s.db = pdb
 	s.tree = tree
-	return nil
+	return batch, dropDb, nil
 }
 
 func (s *IdentityStateDB) DropPreliminary() {
 	pdb := dbm.NewPrefixDB(s.original, loadIdentityPrefix(s.original, true))
-	clearDb(pdb)
-	setIdentityPrefix(s.original, nil, true)
+	common.ClearDb(pdb)
+	b := s.original.NewBatch()
+	setIdentityPrefix(b, nil, true)
+	b.WriteSync()
 }
 
 func (s *IdentityStateDB) CreatePreliminaryCopy(height uint64) (*IdentityStateDB, error) {
 	preliminaryPrefix := identityStatePrefix(height + 1)
 	pdb := dbm.NewPrefixDB(s.original, preliminaryPrefix)
-	it := s.db.Iterator(nil, nil)
-	for ; it.Valid(); it.Next() {
-		pdb.Set(it.Key(), it.Value())
+
+	if err := common.Copy(s.db, pdb); err != nil {
+		return nil, err
 	}
-	setIdentityPrefix(s.original, preliminaryPrefix, true)
+
+	b := s.original.NewBatch()
+	setIdentityPrefix(b, preliminaryPrefix, true)
+	if err := b.WriteSync(); err != nil {
+		return nil, err
+	}
 	return s.LoadPreliminary(height)
 }
 
@@ -373,6 +409,20 @@ func (s *IdentityStateDB) SetPredefinedIdentities(state *PredefinedState) {
 		stateObj.data.Approved = identity.Approved
 		stateObj.touch()
 	}
+}
+
+func (s *IdentityStateDB) FlushToDisk() error {
+	return common.Copy(s.tree.RecentDb(), s.db)
+}
+
+func (s *IdentityStateDB) SwitchTree(keepEvery, keepRecent int64) error {
+	version := s.tree.Version()
+	s.tree = NewMutableTreeWithOpts(s.db, s.tree.RecentDb(), keepEvery, keepRecent)
+	if _, err := s.tree.LoadVersion(version); err != nil {
+		return err
+	}
+	s.Clear()
+	return nil
 }
 
 type IdentityStateDiffValue struct {
@@ -403,19 +453,21 @@ func loadIdentityPrefix(db dbm.DB, preliminary bool) []byte {
 	if preliminary {
 		key = preliminaryIdentityStateDbPrefixKey
 	}
-	p := db.Get(key)
+	p, _ := db.Get(key)
 	if p == nil {
 		p = identityStatePrefix(0)
-		setIdentityPrefix(db, p, preliminary)
+		b := db.NewBatch()
+		setIdentityPrefix(b, p, preliminary)
+		b.WriteSync()
 		return p
 	}
 	return p
 }
 
-func setIdentityPrefix(db dbm.DB, prefix []byte, preliminary bool) {
+func setIdentityPrefix(batch dbm.Batch, prefix []byte, preliminary bool) {
 	key := currentIdentityStateDbPrefixKey
 	if preliminary {
 		key = preliminaryIdentityStateDbPrefixKey
 	}
-	db.Set(key, prefix)
+	batch.Set(key, prefix)
 }

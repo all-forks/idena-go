@@ -2,14 +2,16 @@ package validators
 
 import (
 	"bytes"
+	"encoding/binary"
 	"github.com/deckarep/golang-set"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/rlp"
-	"math/big"
+	"math/rand"
 	"sort"
+	"sync"
 )
 
 type ValidatorsCache struct {
@@ -19,6 +21,8 @@ type ValidatorsCache struct {
 	onlineNodesSet   mapset.Set
 	log              log.Logger
 	god              common.Address
+	mutex            sync.Mutex
+	height           uint64
 }
 
 func NewValidatorsCache(identityState *state.IdentityStateDB, godAddress common.Address) *ValidatorsCache {
@@ -32,12 +36,14 @@ func NewValidatorsCache(identityState *state.IdentityStateDB, godAddress common.
 }
 
 func (v *ValidatorsCache) Load() {
-	v.nodesSet.Clear()
-	v.onlineNodesSet.Clear()
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
 	v.loadValidNodes()
 }
 
-func (v *ValidatorsCache) GetOnlineValidators(seed types.Seed, round uint64, step uint16, limit int) mapset.Set {
+func (v *ValidatorsCache) GetOnlineValidators(seed types.Seed, round uint64, step uint8, limit int) mapset.Set {
+
 	set := mapset.NewSet()
 	if v.OnlineSize() == 0 {
 		set.Add(v.god)
@@ -50,13 +56,22 @@ func (v *ValidatorsCache) GetOnlineValidators(seed types.Seed, round uint64, ste
 		return set
 	}
 
-	cnt := new(big.Int).SetInt64(int64(len(v.validOnlineNodes)))
-	for i := uint32(0); i < uint32(limit*3) && set.Cardinality() < limit; i++ {
-		set.Add(v.validOnlineNodes[indexGenerator(seed, round, step, i, cnt)])
-	}
-	if set.Cardinality() < limit {
+	if len(v.validOnlineNodes) < limit {
 		return nil
 	}
+
+	rndSeed := rlp.Hash([]interface{}{
+		seed, round, step,
+	})
+	randSeed := binary.LittleEndian.Uint64(rndSeed[:])
+	random := rand.New(rand.NewSource(int64(randSeed)))
+
+	indexes := random.Perm(len(v.validOnlineNodes))
+
+	for i := 0; i < limit; i++ {
+		set.Add(v.validOnlineNodes[indexes[i]])
+	}
+
 	return set
 }
 
@@ -81,25 +96,19 @@ func (v *ValidatorsCache) GetAllOnlineValidators() mapset.Set {
 }
 
 func (v *ValidatorsCache) RefreshIfUpdated(godAddress common.Address, block *types.Block) {
-	v.god = godAddress
-	shouldUpdate := block.Header.Flags().HasFlag(types.IdentityUpdate)
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
 
-	if !shouldUpdate {
-		for _, tx := range block.Body.Transactions {
-			if tx.Type == types.OnlineStatusTx {
-				shouldUpdate = true
-				break
-			}
-		}
-	}
-
-	if shouldUpdate {
+	if block.Header.Flags().HasFlag(types.IdentityUpdate) {
 		v.loadValidNodes()
 		v.log.Info("Validators updated", "total", v.nodesSet.Cardinality(), "online", v.onlineNodesSet.Cardinality())
 	}
+	v.god = godAddress
+	v.height = block.Height()
 }
 
 func (v *ValidatorsCache) loadValidNodes() {
+
 	var onlineNodes []common.Address
 	v.nodesSet.Clear()
 	v.onlineNodesSet.Clear()
@@ -127,6 +136,26 @@ func (v *ValidatorsCache) loadValidNodes() {
 	})
 
 	v.validOnlineNodes = sortValidNodes(onlineNodes)
+	v.height = v.identityState.Version()
+}
+
+func (v *ValidatorsCache) Clone() *ValidatorsCache {
+	v.mutex.Lock()
+	defer v.mutex.Unlock()
+
+	return &ValidatorsCache{
+		height:           v.height,
+		identityState:    v.identityState,
+		god:              v.god,
+		log:              v.log,
+		validOnlineNodes: append(v.validOnlineNodes[:0:0], v.validOnlineNodes...),
+		nodesSet:         v.nodesSet.Clone(),
+		onlineNodesSet:   v.onlineNodesSet.Clone(),
+	}
+}
+
+func (v *ValidatorsCache) Height() uint64 {
+	return v.height
 }
 
 func sortValidNodes(nodes []common.Address) []common.Address {
@@ -134,12 +163,4 @@ func sortValidNodes(nodes []common.Address) []common.Address {
 		return bytes.Compare(nodes[i][:], nodes[j][:]) > 0
 	})
 	return nodes
-}
-
-func indexGenerator(seed types.Seed, round uint64, step uint16, iteration uint32, maxValue *big.Int) int64 {
-	data := rlp.Hash([]interface{}{
-		seed, round, step, iteration,
-	})
-	var hash = new(big.Int).SetBytes(data[:])
-	return new(big.Int).Mod(hash, maxValue).Int64()
 }

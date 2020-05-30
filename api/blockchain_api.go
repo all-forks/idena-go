@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"github.com/idena-network/idena-go/blockchain"
 	"github.com/idena-network/idena-go/blockchain/fee"
 	"github.com/idena-network/idena-go/blockchain/types"
@@ -9,6 +10,7 @@ import (
 	"github.com/idena-network/idena-go/core/mempool"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/protocol"
+	"github.com/idena-network/idena-go/rlp"
 	"github.com/ipfs/go-cid"
 	"github.com/shopspring/decimal"
 	"math/big"
@@ -31,6 +33,7 @@ var (
 		types.ChangeGodAddressTx:   "changeGodAddress",
 		types.BurnTx:               "burn",
 		types.ChangeProfileTx:      "changeProfile",
+		types.DeleteFlipTx:         "deleteFlip",
 	}
 )
 
@@ -40,10 +43,10 @@ type BlockchainApi struct {
 	ipfs    ipfs.Proxy
 	pool    *mempool.TxPool
 	d       *protocol.Downloader
-	pm      *protocol.ProtocolManager
+	pm      *protocol.IdenaGossipHandler
 }
 
-func NewBlockchainApi(baseApi *BaseApi, bc *blockchain.Blockchain, ipfs ipfs.Proxy, pool *mempool.TxPool, d *protocol.Downloader, pm *protocol.ProtocolManager) *BlockchainApi {
+func NewBlockchainApi(baseApi *BaseApi, bc *blockchain.Blockchain, ipfs ipfs.Proxy, pool *mempool.TxPool, d *protocol.Downloader, pm *protocol.IdenaGossipHandler) *BlockchainApi {
 	return &BlockchainApi{bc, baseApi, ipfs, pool, d, pm}
 }
 
@@ -150,6 +153,9 @@ type Syncing struct {
 
 func (api *BlockchainApi) Syncing() Syncing {
 	isSyncing := api.d.IsSyncing() || !api.pm.HasPeers() || !api.baseApi.engine.Synced()
+	if api.bc.Config().Consensus.Automine {
+		isSyncing = false
+	}
 	current, highest := api.d.SyncProgress()
 	if !isSyncing {
 		highest = current
@@ -196,6 +202,36 @@ func (api *BlockchainApi) PendingTransactions(args TransactionsArgs) Transaction
 		Transactions: list,
 		Token:        nil,
 	}
+}
+
+func (api *BlockchainApi) FeePerByte() *big.Int {
+	return api.baseApi.getAppState().State.FeePerByte()
+}
+
+func (api *BlockchainApi) SendRawTx(ctx context.Context, bytesTx hexutil.Bytes) (common.Hash, error) {
+	var tx types.Transaction
+	if err := rlp.DecodeBytes(bytesTx, &tx); err != nil {
+		return common.Hash{}, err
+	}
+
+	return api.baseApi.sendInternalTx(ctx, &tx)
+}
+
+func (api *BlockchainApi) GetRawTx(args SendTxArgs) (hexutil.Bytes, error) {
+	var payload []byte
+	if args.Payload != nil {
+		payload = *args.Payload
+	}
+
+	tx := api.baseApi.getTx(args.From, args.To, args.Type, args.Amount, args.MaxFee, args.Tips, args.Nonce, args.Epoch, payload)
+
+	data, err := rlp.EncodeToBytes(tx)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return data, nil
 }
 
 func (api *BlockchainApi) Transactions(args TransactionsArgs) Transactions {
@@ -302,7 +338,7 @@ func convertToBlock(block *types.Block) *Block {
 
 	var coinbase common.Address
 	if !block.IsEmpty() {
-		coinbase = block.Header.ProposedHeader.Coinbase
+		coinbase = block.Header.Coinbase()
 	}
 
 	return &Block{
