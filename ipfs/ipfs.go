@@ -7,9 +7,9 @@ import (
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/eventbus"
 	"github.com/idena-network/idena-go/config"
+	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/events"
 	"github.com/idena-network/idena-go/log"
-	"github.com/idena-network/idena-go/rlp"
 	"github.com/ipfs/go-blockservice"
 	"github.com/ipfs/go-cid"
 	config2 "github.com/ipfs/go-ipfs-config"
@@ -53,9 +53,10 @@ const (
 type DataType = uint32
 
 const (
-	Block   DataType = 1
-	Flip    DataType = 2
-	Profile DataType = 3
+	Block     DataType = 1
+	Flip      DataType = 2
+	Profile   DataType = 3
+	TxReceipt DataType = 3
 )
 
 var (
@@ -526,7 +527,7 @@ func (p *ipfsProxy) Cid(data []byte) (cid.Cid, error) {
 		return EmptyCid, nil
 	}
 
-	hash := rlp.Hash(data)
+	hash := crypto.Hash(data)
 	cacheKey := string(hash[:])
 	if value, ok := p.cidCache.Get(cacheKey); ok {
 		return value.(cid.Cid), nil
@@ -594,6 +595,7 @@ func configureIpfs(cfg *config.IpfsConfig) (*ipfsConf.Config, error) {
 		ipfsConfig.Swarm.ConnMgr.HighWater = cfg.HighWater
 		ipfsConfig.Reprovider.Interval = cfg.ReproviderInterval
 
+		ipfsConfig.Swarm.EnableRelayHop = false
 		if cfg.Profile != "" {
 			transformer, ok := config2.Profiles[cfg.Profile]
 			if !ok {
@@ -610,16 +612,20 @@ func configureIpfs(cfg *config.IpfsConfig) (*ipfsConf.Config, error) {
 	var ipfsConfig *ipfsConf.Config
 
 	datadir, _ := filepath.Abs(cfg.DataDir)
-
 	if !fsrepo.IsInitialized(datadir) {
 		ipfsConfig, err := ipfsConf.Init(os.Stdout, 2048)
 		if err != nil {
 			return nil, err
 		}
 		ipfsConfig.Swarm.EnableAutoRelay = true
-		ipfsConfig.Swarm.EnableRelayHop = true
+		ipfsConfig.Swarm.EnableRelayHop = false
 		ipfsConfig.Experimental.FilestoreEnabled = true
 
+		transformer, _ := config2.Profiles["badgerds"]
+
+		if err := transformer.Transform(ipfsConfig); err != nil {
+			return nil, err
+		}
 		err = updateIpfsConfig(ipfsConfig)
 		if err != nil {
 			return nil, err
@@ -627,8 +633,6 @@ func configureIpfs(cfg *config.IpfsConfig) (*ipfsConf.Config, error) {
 		if err := fsrepo.Init(datadir, ipfsConfig); err != nil {
 			return nil, err
 		}
-
-		writeSwarmKey(datadir, cfg.SwarmKey)
 	} else {
 		ipfsConfig, err := fsrepo.ConfigAt(datadir)
 		if err != nil {
@@ -666,16 +670,15 @@ func configureIpfs(cfg *config.IpfsConfig) (*ipfsConf.Config, error) {
 			return nil, err
 		}
 	}
+	writeSwarmKey(datadir, cfg.SwarmKey)
 	return ipfsConfig, nil
 }
 
 func writeSwarmKey(dataDir string, swarmKey string) {
 	swarmPath := filepath.Join(dataDir, "swarm.key")
-	if _, err := os.Stat(swarmPath); os.IsNotExist(err) {
-		err = ioutil.WriteFile(swarmPath, []byte(fmt.Sprintf("/key/swarm/psk/1.0.0/\n/base16/\n%v", swarmKey)), 0644)
-		if err != nil {
-			log.Error(fmt.Sprintf("Failed to persist swarm file: %v", err))
-		}
+	err := ioutil.WriteFile(swarmPath, []byte(fmt.Sprintf("/key/swarm/psk/1.0.0/\n/base16/\n%v", swarmKey)), 0644)
+	if err != nil {
+		log.Error(fmt.Sprintf("Failed to persist swarm file: %v", err))
 	}
 }
 
@@ -693,6 +696,7 @@ func getNodeConfig(dataDir string) *core.BuildCfg {
 			"mplex":  false,
 		},
 	}
+
 }
 
 func loadPlugins(cfg *config.IpfsConfig) error {

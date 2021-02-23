@@ -1,21 +1,22 @@
 package database
 
 import (
-	"bytes"
 	"encoding/binary"
+	"github.com/golang/protobuf/proto"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/math"
 	"github.com/idena-network/idena-go/log"
-	"github.com/idena-network/idena-go/rlp"
+	models "github.com/idena-network/idena-go/protobuf"
 	dbm "github.com/tendermint/tm-db"
+	math2 "math"
 	"math/big"
 	"sort"
-	"time"
 )
 
 const (
 	MaxWeakCertificatesCount = 100
+	maxEventName             = "\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F\u007F"
 )
 
 type Repo struct {
@@ -26,12 +27,6 @@ func NewRepo(db dbm.DB) *Repo {
 	return &Repo{
 		db: db,
 	}
-}
-
-func encodeUint16Number(number uint16) []byte {
-	enc := make([]byte, 2)
-	binary.BigEndian.PutUint16(enc, number)
-	return enc
 }
 
 func encodeUint32Number(number uint32) []byte {
@@ -67,11 +62,23 @@ func txIndexKey(hash common.Hash) []byte {
 	return append(transactionIndexPrefix, hash.Bytes()...)
 }
 
-func savedTxKey(sender common.Address, timestamp uint64, nonce uint32, hash common.Hash) []byte {
+func receiptIndexKey(hash common.Hash) []byte {
+	return append(receiptIndexPrefix, hash.Bytes()...)
+}
+
+func savedTxKey(sender common.Address, timestamp int64, nonce uint32, hash common.Hash) []byte {
 	key := append(ownTransactionIndexPrefix, sender[:]...)
-	key = append(key, encodeUint64Number(timestamp)...)
+	key = append(key, encodeUint64Number(uint64(timestamp))...)
 	key = append(key, encodeUint32Number(nonce)...)
 	return append(key, hash[:]...)
+}
+
+func savedEventKey(contact common.Address, txHash []byte, idx uint32, event string) []byte {
+	key := append(eventPrefix, contact.Bytes()...)
+	key = append(key, txHash...)
+	key = append(key, common.ToBytes(idx)...)
+	key = append(key, []byte(event)...)
+	return key
 }
 
 func burntCoinsKey(height uint64, hash common.Hash) []byte {
@@ -94,8 +101,8 @@ func (r *Repo) ReadBlockHeader(hash common.Hash) *types.Header {
 		return nil
 	}
 	header := new(types.Header)
-	if err := rlp.Decode(bytes.NewReader(data), header); err != nil {
-		log.Error("Invalid block header RLP", "hash", hash, "err", err)
+	if err := header.FromBytes(data); err != nil {
+		log.Error("Invalid block header proto", "hash", hash, "err", err)
 		return nil
 	}
 	return header
@@ -108,8 +115,8 @@ func (r *Repo) ReadHead() *types.Header {
 		return nil
 	}
 	header := new(types.Header)
-	if err := rlp.Decode(bytes.NewReader(data), header); err != nil {
-		log.Error("Invalid block header RLP", "err", err)
+	if err := header.FromBytes(data); err != nil {
+		log.Error("Invalid block header proto", "err", err)
 		return nil
 	}
 	return header
@@ -117,9 +124,9 @@ func (r *Repo) ReadHead() *types.Header {
 
 func (r *Repo) WriteHead(batch dbm.Batch, header *types.Header) {
 	// Write the encoded header
-	data, err := rlp.EncodeToBytes(header)
+	data, err := header.ToBytes()
 	if err != nil {
-		log.Crit("Failed to RLP encode header", "err", err)
+		log.Crit("Failed to proto encode header", "err", err)
 		return
 	}
 	if batch != nil {
@@ -130,9 +137,9 @@ func (r *Repo) WriteHead(batch dbm.Batch, header *types.Header) {
 }
 
 func (r *Repo) WriteBlockHeader(header *types.Header) {
-	data, err := rlp.EncodeToBytes(header)
+	data, err := header.ToBytes()
 	if err != nil {
-		log.Crit("Failed to RLP encode header", "err", err)
+		log.Crit("Failed to proto encode header", "err", err)
 	}
 
 	r.db.Set(headerKey(header.Hash()), data)
@@ -143,9 +150,9 @@ func (r *Repo) RemoveHeader(hash common.Hash) {
 }
 
 func (r *Repo) WriteCertificate(hash common.Hash, cert *types.BlockCert) {
-	data, err := rlp.EncodeToBytes(cert)
+	data, err := cert.ToBytes()
 	if err != nil {
-		log.Crit("failed to RLP encode block cert", "err", err)
+		log.Crit("failed to proto encode block cert", "err", err)
 	}
 	r.db.Set(certKey(hash), data)
 }
@@ -186,9 +193,9 @@ func (r *Repo) SetHead(batch dbm.Batch, height uint64) {
 }
 
 func (r *Repo) WriteTxIndex(txHash common.Hash, index *types.TransactionIndex) {
-	data, err := rlp.EncodeToBytes(index)
+	data, err := index.ToBytes()
 	if err != nil {
-		log.Crit("failed to RLP encode transaction index", "err", err)
+		log.Crit("failed to proto encode transaction index", "err", err)
 		return
 	}
 	r.db.Set(txIndexKey(txHash), data)
@@ -202,8 +209,32 @@ func (r *Repo) ReadTxIndex(hash common.Hash) *types.TransactionIndex {
 		return nil
 	}
 	index := new(types.TransactionIndex)
-	if err := rlp.DecodeBytes(data, index); err != nil {
-		log.Error("invalid transaction index RLP", "err", err)
+	if err := index.FromBytes(data); err != nil {
+		log.Error("invalid transaction index proto", "err", err)
+		return nil
+	}
+	return index
+}
+
+func (r *Repo) WriteReceiptIndex(hash common.Hash, idx *types.TxReceiptIndex) {
+	data, err := idx.ToBytes()
+	if err != nil {
+		log.Crit("failed to proto encode receipt index", "err", err)
+		return
+	}
+	r.db.Set(receiptIndexKey(hash), data)
+}
+
+func (r *Repo) ReadReceiptIndex(hash common.Hash) *types.TxReceiptIndex {
+	key := receiptIndexKey(hash)
+	data, err := r.db.Get(key)
+	assertNoError(err)
+	if data == nil {
+		return nil
+	}
+	index := new(types.TxReceiptIndex)
+	if err := index.FromBytes(data); err != nil {
+		log.Error("invalid receipt index proto", "err", err)
 		return nil
 	}
 	return index
@@ -216,35 +247,31 @@ func (r *Repo) ReadCertificate(hash common.Hash) *types.BlockCert {
 		return nil
 	}
 	cert := new(types.BlockCert)
-	if err := rlp.DecodeBytes(data, cert); err != nil {
-		log.Error("Invalid block cert RLP", "err", err)
+	if err := cert.FromBytes(data); err != nil {
+		log.Error("Invalid block cert proto", "err", err)
 		return nil
 	}
 	return cert
 }
 
-type weakCeritificates struct {
-	Hashes []common.Hash
-}
-
-func (r *Repo) readWeakCertificates() *weakCeritificates {
+func (r *Repo) readWeakCertificates() *models.ProtoWeakCertificates {
 	data, err := r.db.Get(weakCertificatesKey)
 	assertNoError(err)
 	if data == nil {
 		return nil
 	}
-	w := new(weakCeritificates)
-	if err := rlp.Decode(bytes.NewReader(data), w); err != nil {
-		log.Error("invalid weak certificates RLP", "err", err)
+	w := new(models.ProtoWeakCertificates)
+	if err := proto.Unmarshal(data, w); err != nil {
+		log.Error("invalid weak certificates proto", "err", err)
 		return nil
 	}
 	return w
 }
 
-func (r *Repo) writeWeakCertificate(w *weakCeritificates) {
-	data, err := rlp.EncodeToBytes(w)
+func (r *Repo) writeWeakCertificate(w *models.ProtoWeakCertificates) {
+	data, err := proto.Marshal(w)
 	if err != nil {
-		log.Crit("failed to RLP encode weak certificates", "err", err)
+		log.Crit("failed to proto encode weak certificates", "err", err)
 		return
 	}
 	r.db.Set(weakCertificatesKey, data)
@@ -257,22 +284,15 @@ func (r *Repo) removeCertificate(hash common.Hash) {
 func (r *Repo) WriteWeakCertificate(hash common.Hash) {
 	weakCerts := r.readWeakCertificates()
 	if weakCerts == nil {
-		weakCerts = &weakCeritificates{}
+		weakCerts = &models.ProtoWeakCertificates{}
 	}
-	weakCerts.Hashes = append(weakCerts.Hashes, hash)
+	weakCerts.Hashes = append(weakCerts.Hashes, hash[:])
 
 	if len(weakCerts.Hashes) > MaxWeakCertificatesCount {
-		r.removeCertificate(weakCerts.Hashes[0])
+		r.removeCertificate(common.BytesToHash(weakCerts.Hashes[0]))
 		weakCerts.Hashes = weakCerts.Hashes[1:]
 	}
 	r.writeWeakCertificate(weakCerts)
-}
-
-type dbSnapshotManifest struct {
-	Cid      []byte
-	Height   uint64
-	FileName string
-	Root     common.Hash
 }
 
 func (r *Repo) LastSnapshotManifest() (cid []byte, root common.Hash, height uint64, fileName string) {
@@ -281,24 +301,24 @@ func (r *Repo) LastSnapshotManifest() (cid []byte, root common.Hash, height uint
 	if data == nil {
 		return nil, common.Hash{}, 0, ""
 	}
-	manifest := new(dbSnapshotManifest)
-	if err := rlp.Decode(bytes.NewReader(data), manifest); err != nil {
-		log.Error("invalid snapshot manifest RLP", "err", err)
+	manifest := new(models.ProtoSnapshotManifestDb)
+	if err := proto.Unmarshal(data, manifest); err != nil {
+		log.Error("invalid snapshot manifest proto", "err", err)
 		return nil, common.Hash{}, 0, ""
 	}
-	return manifest.Cid, manifest.Root, manifest.Height, manifest.FileName
+	return manifest.Cid, common.BytesToHash(manifest.Root), manifest.Height, manifest.FileName
 }
 
 func (r *Repo) WriteLastSnapshotManifest(cid []byte, root common.Hash, height uint64, fileName string) error {
-	manifest := dbSnapshotManifest{
+	manifest := &models.ProtoSnapshotManifestDb{
 		Cid:      cid,
 		Height:   height,
 		FileName: fileName,
-		Root:     root,
+		Root:     root[:],
 	}
-	data, err := rlp.EncodeToBytes(manifest)
+	data, err := proto.Marshal(manifest)
 	if err != nil {
-		log.Crit("failed to RLP encode snapshot manifest", "err", err)
+		log.Crit("failed to proto encode snapshot manifest", "err", err)
 		return err
 	}
 	r.db.Set(lastSnapshotKey, data)
@@ -316,9 +336,9 @@ func (r *Repo) ReadIdentityStateDiff(height uint64) []byte {
 }
 
 func (r *Repo) WritePreliminaryHead(header *types.Header) {
-	data, err := rlp.EncodeToBytes(header)
+	data, err := header.ToBytes()
 	if err != nil {
-		log.Crit("Failed to RLP encode header", "err", err)
+		log.Crit("Failed to proto encode header", "err", err)
 		return
 	}
 	assertNoError(r.db.Set(preliminaryHeadKey, data))
@@ -331,8 +351,8 @@ func (r *Repo) ReadPreliminaryHead() *types.Header {
 		return nil
 	}
 	header := new(types.Header)
-	if err := rlp.Decode(bytes.NewReader(data), header); err != nil {
-		log.Error("Invalid block header RLP", "err", err)
+	if err := header.FromBytes(data); err != nil {
+		log.Error("Invalid block header proto", "err", err)
 		return nil
 	}
 	return header
@@ -346,68 +366,39 @@ func (r *Repo) RemovePreliminaryHead(batch dbm.Batch) {
 	}
 }
 
-type activityMonitorDb struct {
-	UpdateDt uint64
-	Data     []*addrActivityDb
-}
-
-type addrActivityDb struct {
-	Addr common.Address
-	Time uint64
-}
-
 func (r *Repo) ReadActivity() *types.ActivityMonitor {
 	data, err := r.db.Get(activityMonitorKey)
 	assertNoError(err)
 	if data == nil {
 		return nil
 	}
-	dbMonitor := new(activityMonitorDb)
-	if err := rlp.Decode(bytes.NewReader(data), dbMonitor); err != nil {
-		log.Error("invalid activity monitor RLP", "err", err)
+	monitor := new(types.ActivityMonitor)
+	if err := monitor.FromBytes(data); err != nil {
+		log.Error("invalid activity monitor proto", "err", err)
 		return nil
 	}
-	monitor := &types.ActivityMonitor{
-		UpdateDt: time.Unix(int64(dbMonitor.UpdateDt), 0),
-	}
-	for _, item := range dbMonitor.Data {
-		monitor.Data = append(monitor.Data, &types.AddrActivity{
-			Addr: item.Addr,
-			Time: time.Unix(int64(item.Time), 0),
-		})
-	}
-
 	return monitor
 }
 
 func (r *Repo) WriteActivity(monitor *types.ActivityMonitor) {
-	dbMonitor := &activityMonitorDb{
-		UpdateDt: uint64(monitor.UpdateDt.Unix()),
-	}
-	for _, item := range monitor.Data {
-		dbMonitor.Data = append(dbMonitor.Data, &addrActivityDb{
-			Addr: item.Addr,
-			Time: uint64(item.Time.Unix()),
-		})
-	}
-	data, err := rlp.EncodeToBytes(dbMonitor)
+	data, err := monitor.ToBytes()
 	if err != nil {
-		log.Crit("failed to RLP encode activity monitor", "err", err)
+		log.Crit("failed to proto encode activity monitor", "err", err)
 		return
 	}
 	r.db.Set(activityMonitorKey, data)
 }
 
-func (r *Repo) SaveTx(address common.Address, blockHash common.Hash, timestamp uint64, feePerByte *big.Int, transaction *types.Transaction) {
+func (r *Repo) SaveTx(address common.Address, blockHash common.Hash, timestamp int64, feePerGas *big.Int, transaction *types.Transaction) {
 	s := &types.SavedTransaction{
-		Tx:         transaction,
-		FeePerByte: feePerByte,
-		BlockHash:  blockHash,
-		Timestamp:  timestamp,
+		Tx:        transaction,
+		FeePerGas: feePerGas,
+		BlockHash: blockHash,
+		Timestamp: timestamp,
 	}
-	data, err := rlp.EncodeToBytes(s)
+	data, err := s.ToBytes()
 	if err != nil {
-		log.Crit("failed to RLP encode saved transaction", "err", err)
+		log.Crit("failed to proto encode saved transaction", "err", err)
 		return
 	}
 
@@ -417,7 +408,7 @@ func (r *Repo) SaveTx(address common.Address, blockHash common.Hash, timestamp u
 func (r *Repo) GetSavedTxs(address common.Address, count int, token []byte) (txs []*types.SavedTransaction, nextToken []byte) {
 
 	if token == nil {
-		token = savedTxKey(address, uint64(math.MaxUint64), uint32(math.MaxUint32), common.BytesToHash(common.MaxHash))
+		token = savedTxKey(address, math.MaxInt64, uint32(math.MaxUint32), common.BytesToHash(common.MaxHash))
 	} else {
 		token = append(token, common.MaxHash...)
 	}
@@ -433,7 +424,7 @@ func (r *Repo) GetSavedTxs(address common.Address, count int, token []byte) (txs
 			return txs, continuationToken
 		}
 		tx := new(types.SavedTransaction)
-		if err := rlp.DecodeBytes(value, tx); err != nil {
+		if err := tx.FromBytes(value); err != nil {
 			log.Error("cannot parse tx", "key", key)
 			continue
 		}
@@ -462,9 +453,9 @@ func (r *Repo) SaveBurntCoins(blockHeight uint64, txHash common.Hash, address co
 		Key:     key,
 		Amount:  amount,
 	}
-	data, err := rlp.EncodeToBytes(s)
+	data, err := s.ToBytes()
 	if err != nil {
-		log.Crit("failed to RLP encode saved burnt coins", "err", err)
+		log.Crit("failed to proto encode saved burnt coins", "err", err)
 		return
 	}
 	r.db.Set(burntCoinsKey(blockHeight, txHash), data)
@@ -480,7 +471,7 @@ func (r *Repo) GetTotalBurntCoins() []*types.BurntCoins {
 	for ; it.Valid(); it.Next() {
 		key, value := it.Key(), it.Value()
 		burntCoins := new(types.BurntCoins)
-		if err := rlp.DecodeBytes(value, burntCoins); err != nil {
+		if err := burntCoins.FromBytes(value); err != nil {
 			log.Error("cannot parse burnt coins", "key", key)
 			continue
 		}
@@ -507,4 +498,122 @@ func (r *Repo) GetTotalBurntCoins() []*types.BurntCoins {
 	})
 
 	return res
+}
+
+func (r *Repo) WriteEvent(contract common.Address, txHash common.Hash, idx uint32, event *types.TxEvent) {
+	e := types.SavedEvent{
+		Contract: contract,
+		Event:    event.EventName,
+		Args:     event.Data,
+	}
+	data, err := e.ToBytes()
+	if err != nil {
+		log.Crit("failed to proto encode saved event", "err", err)
+		return
+	}
+	r.db.Set(savedEventKey(contract, txHash.Bytes(), idx, event.EventName), data)
+}
+
+func (r *Repo) GetSavedEvents(contract common.Address) (events []*types.SavedEvent) {
+
+	it, err := r.db.ReverseIterator(savedEventKey(contract, common.MinHash[:], 0, "\x00"), savedEventKey(contract, common.MaxHash, math2.MaxUint32, maxEventName))
+	assertNoError(err)
+	defer it.Close()
+	for ; it.Valid(); it.Next() {
+		key, value := it.Key(), it.Value()
+		e := new(types.SavedEvent)
+		if err := e.FromBytes(value); err != nil {
+			log.Error("cannot parse tx", "key", key)
+			continue
+		}
+		events = append(events, e)
+	}
+	return events
+}
+
+func (r *Repo) WriteIntermediateGenesis(batch dbm.Batch, height uint64) {
+	if batch != nil {
+		batch.Set(intermediateGenesisKey, common.ToBytes(height))
+	} else{
+		r.db.Set(intermediateGenesisKey, common.ToBytes(height))
+	}
+}
+
+func (r *Repo) ReadIntermediateGenesis() uint64 {
+	data, err := r.db.Get(intermediateGenesisKey)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(data)
+}
+
+func (r *Repo) WriteUpgradeVotes(votes *types.UpgradeVotes) {
+	data, _ := votes.ToBytes()
+	r.db.Set(upgradeVotesKey, data)
+}
+
+func (r *Repo) ReadUpgradeVotes() *types.UpgradeVotes {
+	data, _ := r.db.Get(upgradeVotesKey)
+	if len(data) > 0 {
+		v := types.NewUpgradeVotes()
+		v.FromBytes(data)
+		return v
+	}
+	return nil
+}
+
+func (r *Repo) WriteConsensusVersion(batch dbm.Batch, v uint32) {
+	if batch != nil {
+		batch.Set(consensusVersionKey, common.ToBytes(v))
+	} else {
+		r.db.Set(consensusVersionKey, common.ToBytes(v))
+	}
+}
+
+func (r *Repo) ReadConsensusVersion() uint32 {
+	data, err := r.db.Get(consensusVersionKey)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(data)
+}
+
+func (r *Repo) WritePreliminaryConsensusVersion(v uint32) {
+	r.db.Set(preliminaryConsVersionKey, common.ToBytes(v))
+}
+
+func (r *Repo) ReadPreliminaryConsensusVersion() uint32 {
+	data, err := r.db.Get(preliminaryConsVersionKey)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(data)
+}
+
+func (r *Repo) RemovePreliminaryConsensusVersion(batch dbm.Batch) {
+	if batch != nil {
+		batch.Delete(preliminaryConsVersionKey)
+	} else {
+		r.db.Delete(preliminaryConsVersionKey)
+	}
+}
+
+func (r *Repo) WritePreliminaryIntermediateGenesis(height uint64) {
+	r.db.Set(preliminaryIntermediateGenesisKey, common.ToBytes(height))
+}
+
+func (r *Repo) ReadPreliminaryIntermediateGenesis() uint64 {
+	data, err := r.db.Get(preliminaryIntermediateGenesisKey)
+	if err != nil || len(data) == 0 {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(data)
+}
+
+func (r *Repo) RemovePreliminaryIntermediateGenesis(batch dbm.Batch) {
+	if batch != nil {
+		batch.Delete(preliminaryIntermediateGenesisKey)
+	} else {
+		r.db.Delete(preliminaryIntermediateGenesisKey)
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/secstore"
+	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/stretchr/testify/require"
 	"github.com/tendermint/tm-db"
 	"math/big"
@@ -17,12 +18,12 @@ import (
 
 func TestTxPool_addDeferredTx(t *testing.T) {
 	bus := eventbus.New()
-	appState := appstate.NewAppState(db.NewMemDB(), bus)
+	appState, _ := appstate.NewAppState(db.NewMemDB(), bus)
 
 	key, _ := crypto.GenerateKey()
 	secStore := secstore.NewSecStore()
 	secStore.AddKey(crypto.FromECDSA(key))
-	pool := NewTxPool(appState, bus, &config.Mempool{TxPoolQueueSlots: -1, TxPoolAddrQueueLimit: -1})
+	pool := NewTxPool(appState, bus, &config.Mempool{TxPoolQueueSlots: -1, TxPoolAddrQueueLimit: -1}, collector.NewStatsCollector())
 	r := require.New(t)
 
 	key, _ = crypto.GenerateKey()
@@ -137,7 +138,7 @@ func TestTxPool_ResetTo(t *testing.T) {
 		require.Equal(t, cnt, len(pool.all.txs))
 	}
 	assertTxs()
-	for height := 2; height <= 5; height++ {
+	for height := 2; height <= 13; height++ {
 
 		builtTxs := pool.BuildBlockTransactions()
 		require.True(t, len(builtTxs) > 0)
@@ -160,15 +161,15 @@ func TestTxPool_ResetTo(t *testing.T) {
 		assertTxs()
 	}
 
-	require.Len(t, pool.all.txs, 0)
-	require.Len(t, pool.executableTxs, 0)
-	require.Len(t, pool.pendingTxs, 0)
+	require.Equal(t, 0, len(pool.all.txs))
+	require.Equal(t, 0, len(pool.executableTxs))
+	require.Equal(t, 0, len(pool.pendingTxs))
 }
 
 func getPool() *TxPool {
 	bus := eventbus.New()
-	appState := appstate.NewAppState(db.NewMemDB(), bus)
-	return NewTxPool(appState, bus, config.GetDefaultMempoolConfig())
+	appState, _ := appstate.NewAppState(db.NewMemDB(), bus)
+	return NewTxPool(appState, bus, config.GetDefaultMempoolConfig(), collector.NewStatsCollector())
 }
 
 func TestSortedTxs_Remove(t *testing.T) {

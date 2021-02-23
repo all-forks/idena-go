@@ -9,8 +9,8 @@ import (
 	"github.com/idena-network/idena-go/config"
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/state"
+	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/log"
-	"github.com/idena-network/idena-go/rlp"
 	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/shopspring/decimal"
 	math2 "math"
@@ -81,29 +81,56 @@ func addSuccessfulValidationReward(appState *appstate.AppState, config *config.C
 	})
 }
 
+func getFlipRewardCoef(grade types.Grade) float32 {
+	switch grade {
+	case types.GradeD:
+		return 1
+	case types.GradeC:
+		return 2
+	case types.GradeB:
+		return 4
+	case types.GradeA:
+		return 8
+	default:
+		return 0
+	}
+}
+
 func addFlipReward(appState *appstate.AppState, config *config.ConsensusConf, validationResults *types.ValidationResults,
 	totalReward decimal.Decimal, statsCollector collector.StatsCollector) {
 	flipRewardD := totalReward.Mul(decimal.NewFromFloat32(config.FlipRewardPercent))
 
-	totalFlips := float32(0)
+	totalWeight := float32(0)
 	for _, author := range validationResults.GoodAuthors {
 		if author.Missed {
 			continue
 		}
-		totalFlips += float32(len(author.StrongFlipCids) + len(author.WeakFlipCids))
+		for _, f := range author.FlipsToReward {
+			totalWeight += getFlipRewardCoef(f.Grade)
+		}
 	}
-	if totalFlips == 0 {
+	for _, reporters := range validationResults.ReportersToRewardByFlip {
+		if len(reporters) == 0 {
+			continue
+		}
+		totalWeight += 1
+	}
+
+	if totalWeight == 0 {
 		return
 	}
-	flipRewardShare := flipRewardD.Div(decimal.NewFromFloat32(totalFlips))
+	flipRewardShare := flipRewardD.Div(decimal.NewFromFloat32(totalWeight))
 	collector.SetTotalFlipsReward(statsCollector, math.ToInt(flipRewardD), math.ToInt(flipRewardShare))
 
 	for addr, author := range validationResults.GoodAuthors {
 		if author.Missed {
 			continue
 		}
-		totalReward := flipRewardShare.Mul(decimal.NewFromFloat32(float32(len(author.StrongFlipCids) +
-			len(author.WeakFlipCids))))
+		var weight float32
+		for _, f := range author.FlipsToReward {
+			weight += getFlipRewardCoef(f.Grade)
+		}
+		totalReward := flipRewardShare.Mul(decimal.NewFromFloat32(weight))
 		reward, stake := splitReward(math.ToInt(totalReward), author.NewIdentityState == uint8(state.Newbie), config)
 		collector.BeginEpochRewardBalanceUpdate(statsCollector, addr, appState)
 		appState.State.AddBalance(addr, reward)
@@ -111,8 +138,25 @@ func addFlipReward(appState *appstate.AppState, config *config.ConsensusConf, va
 		collector.CompleteBalanceUpdate(statsCollector, appState)
 		collector.AddMintedCoins(statsCollector, reward)
 		collector.AddMintedCoins(statsCollector, stake)
-		collector.AddFlipsReward(statsCollector, addr, reward, stake, author.StrongFlipCids, author.WeakFlipCids)
+		collector.AddFlipsReward(statsCollector, addr, reward, stake, author.FlipsToReward)
 		collector.AfterAddStake(statsCollector, addr, stake, appState)
+	}
+	for flipIdx, reporters := range validationResults.ReportersToRewardByFlip {
+		if len(reporters) == 0 {
+			continue
+		}
+		totalReward := flipRewardShare.Div(decimal.NewFromInt(int64(len(reporters))))
+		for _, reporter := range reporters {
+			reward, stake := splitReward(math.ToInt(totalReward), reporter.NewIdentityState == uint8(state.Newbie), config)
+			collector.BeginEpochRewardBalanceUpdate(statsCollector, reporter.Address, appState)
+			appState.State.AddBalance(reporter.Address, reward)
+			appState.State.AddStake(reporter.Address, stake)
+			collector.CompleteBalanceUpdate(statsCollector, appState)
+			collector.AddMintedCoins(statsCollector, reward)
+			collector.AddMintedCoins(statsCollector, stake)
+			collector.AddReportedFlipsReward(statsCollector, reporter.Address, flipIdx, reward, stake)
+			collector.AfterAddStake(statsCollector, reporter.Address, stake, appState)
+		}
 	}
 }
 
@@ -151,7 +195,7 @@ func addInvitationReward(appState *appstate.AppState, config *config.ConsensusCo
 			totalWeight += getInvitationRewardCoef(successfulInvite.Age, config)
 		}
 		for i := uint8(0); i < inviter.SavedInvites; i++ {
-			addresses = addAddress(addresses, rlp.Hash(append(addr[:], i)))
+			addresses = addAddress(addresses, crypto.Hash(append(addr[:], i)))
 		}
 	}
 
@@ -195,7 +239,7 @@ func addInvitationReward(appState *appstate.AppState, config *config.ConsensusCo
 			}
 		}
 		for i := uint8(0); i < inviter.SavedInvites; i++ {
-			hash := rlp.Hash(append(addr[:], i))
+			hash := crypto.Hash(append(addr[:], i))
 			if _, ok := win[hash]; ok {
 				totalReward := invitationRewardShare.Mul(decimal.NewFromFloat32(config.SavedInviteWinnerRewardCoef))
 				addReward(addr, totalReward, isNewbie, 0, nil, true)

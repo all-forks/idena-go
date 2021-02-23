@@ -1,17 +1,13 @@
 package ceremony
 
 import (
-	"bytes"
 	"container/list"
 	"encoding/binary"
-	"github.com/idena-network/idena-go/common"
-	"github.com/idena-network/idena-go/rlp"
 	"math/rand"
 )
 
 const (
-	GeneticRelationLength = 3
-	CandidatesPerAuthor   = 13
+	CandidatesPerAuthor = 13
 )
 
 func GetAuthorsDistribution(candidates []*candidate, seed []byte, shortFlipsCount int) (authorsPerCandidate map[int][]int, candidatesPerAuthor map[int][]int) {
@@ -49,7 +45,7 @@ func getFirstAuthorsDistribution(authorsIndexes []int, candidates []*candidate, 
 		}
 
 		// for current candidate try to find suitable author
-		suitableAuthor := getNextSuitablePair(candidates, queue, candidateIndex, authorsPerCandidate[candidateIndex])
+		suitableAuthor := getNextSuitablePair(queue, candidateIndex, authorsPerCandidate[candidateIndex])
 
 		authorsPerCandidate[candidateIndex] = append(authorsPerCandidate[candidateIndex], suitableAuthor)
 		candidatesPerAuthor[suitableAuthor] = append(candidatesPerAuthor[suitableAuthor], candidateIndex)
@@ -96,7 +92,7 @@ func appendAdditionalCandidates(seed []byte, candidates []*candidate, authorsPer
 			}
 
 			// for current author try to find suitable candidate
-			suitableCandidate := getNextSuitablePair(candidates, candidatesQueue, author, candidatesPerAuthor[author])
+			suitableCandidate := getNextSuitablePair(candidatesQueue, author, candidatesPerAuthor[author])
 
 			currentCount++
 			candidatesPerAuthor[author] = append(candidatesPerAuthor[author], suitableCandidate)
@@ -123,9 +119,9 @@ func GetFlipsDistribution(candidatesCount int, authorsPerCandidate map[int][]int
 
 	usedAuthors := make([]int, candidatesCount)
 	currentFlipIndexByAuthor := make([]int, candidatesCount)
-	hashMap := make(map[common.Hash]int)
+	hashMap := make(map[string]int)
 	for idx, item := range flips {
-		hashMap[common.Hash(rlp.Hash(item))] = idx
+		hashMap[string(item)] = idx
 	}
 
 	randSeed := binary.LittleEndian.Uint64(seed)
@@ -148,8 +144,7 @@ func GetFlipsDistribution(candidatesCount int, authorsPerCandidate map[int][]int
 	}
 
 	addFlip := func(arr []int, f []byte) []int {
-		flipHash := common.Hash(rlp.Hash(f))
-		flipGlobalIndex := hashMap[flipHash]
+		flipGlobalIndex := hashMap[string(f)]
 		return append(arr, flipGlobalIndex)
 	}
 
@@ -248,24 +243,10 @@ func GetFlipsDistribution(candidatesCount int, authorsPerCandidate map[int][]int
 	return shortFlipsPerCandidate, longFlipsPerCandidate
 }
 
-func getNextSuitablePair(candidates []*candidate, indexesQueue Queue, currentCandidate int, currentCandidateUsedIndexes []int) (suitableCandidatePair int) {
-
-	// first traversal (with relation)
+func getNextSuitablePair(indexesQueue Queue, currentCandidate int, currentCandidateUsedIndexes []int) (suitableCandidatePair int) {
 	for i := 0; i < indexesQueue.Len(); i++ {
 		nextCandidate := indexesQueue.Pop()
-		if checkIfCandidateSuits(candidates, currentCandidate, nextCandidate, currentCandidateUsedIndexes, hasRelation) {
-			return nextCandidate
-		} else {
-			indexesQueue.Push(nextCandidate)
-		}
-	}
-
-	// second traversal (without relation)
-	for i := 0; i < indexesQueue.Len(); i++ {
-		nextCandidate := indexesQueue.Pop()
-		if checkIfCandidateSuits(candidates, currentCandidate, nextCandidate, currentCandidateUsedIndexes, func(first *candidate, second *candidate, geneticOverlapLength int) bool {
-			return false
-		}) {
+		if currentCandidate != nextCandidate && !contains(currentCandidateUsedIndexes, nextCandidate) {
 			return nextCandidate
 		} else {
 			indexesQueue.Push(nextCandidate)
@@ -274,12 +255,6 @@ func getNextSuitablePair(candidates []*candidate, indexesQueue Queue, currentCan
 
 	nextCandidate := indexesQueue.Pop()
 	return nextCandidate
-}
-
-func checkIfCandidateSuits(candidates []*candidate, currentCandidate int, nextCandidate int, currentCandidateUsedIndexes []int, hasRelationFn func(first *candidate, second *candidate, geneticOverlapLength int) bool) bool {
-	return currentCandidate != nextCandidate &&
-		!hasRelationFn(candidates[currentCandidate], candidates[nextCandidate], GeneticRelationLength) &&
-		!contains(currentCandidateUsedIndexes, nextCandidate)
 }
 
 func contains(s []int, e int) bool {
@@ -323,25 +298,6 @@ func getAuthorsIndexes(candidates []*candidate) []int {
 		}
 	}
 	return authors
-}
-
-func hasRelation(first *candidate, second *candidate, geneticOverlapLength int) bool {
-
-	res := func(a *candidate, b *candidate) bool {
-		codeLength := len(a.Code)
-		diff := b.Generation - a.Generation
-		if diff > uint32(codeLength-geneticOverlapLength) {
-			return false
-		}
-
-		return bytes.Compare(a.Code[diff:][:geneticOverlapLength], b.Code[:geneticOverlapLength]) == 0
-	}
-
-	if first.Generation <= second.Generation {
-		return res(first, second)
-	} else {
-		return res(second, first)
-	}
 }
 
 // Queue is a queue

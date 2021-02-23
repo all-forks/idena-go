@@ -1,7 +1,6 @@
 package blockchain
 
 import (
-	"fmt"
 	"github.com/idena-network/idena-go/blockchain/attachments"
 	fee2 "github.com/idena-network/idena-go/blockchain/fee"
 	"github.com/idena-network/idena-go/blockchain/types"
@@ -25,7 +24,7 @@ func Test_ApplyBlockRewards(t *testing.T) {
 	header := &types.ProposedHeader{
 		Height:         2,
 		ParentHash:     chain.Head.Hash(),
-		Time:           new(big.Int).SetInt64(time.Now().UTC().Unix()),
+		Time:           time.Now().UTC().Unix(),
 		ProposerPubKey: chain.pubKey,
 		TxHash:         types.DeriveSha(types.Transactions([]*types.Transaction{})),
 	}
@@ -59,8 +58,6 @@ func Test_ApplyBlockRewards(t *testing.T) {
 
 	expectedBalance, stake := splitReward(totalReward, false, chain.config.Consensus)
 
-	fmt.Printf("%v\n%v", expectedBalance, appState.State.GetBalance(chain.coinBaseAddress))
-
 	require.Equal(t, 0, expectedBalance.Cmp(appState.State.GetBalance(chain.coinBaseAddress)))
 	require.Equal(t, 0, stake.Cmp(appState.State.GetStakeBalance(chain.coinBaseAddress)))
 }
@@ -91,7 +88,7 @@ func Test_ApplyInviteTx(t *testing.T) {
 
 	signed, _ := types.SignTx(tx, key)
 
-	chain.ApplyTxOnState(chain.appState, signed, nil)
+	chain.ApplyTxOnState(chain.appState, nil, signed, nil)
 
 	require.Equal(t, uint8(0), stateDb.GetInvites(addr))
 	require.Equal(t, state.Invite, stateDb.GetIdentityState(receiver))
@@ -123,7 +120,7 @@ func Test_ApplyActivateTx(t *testing.T) {
 
 	signed, _ := types.SignTx(tx, key)
 
-	chain.ApplyTxOnState(chain.appState, signed, nil)
+	chain.ApplyTxOnState(chain.appState, nil, signed, nil)
 	require.Equal(t, state.Killed, appState.State.GetIdentityState(sender))
 	require.Equal(t, 0, big.NewInt(0).Cmp(appState.State.GetBalance(sender)))
 
@@ -136,13 +133,10 @@ func Test_ApplyKillTx(t *testing.T) {
 	chain, appState, _, _ := NewTestBlockchain(true, nil)
 
 	key, _ := crypto.GenerateKey()
-	key2, _ := crypto.GenerateKey()
 	sender := crypto.PubkeyToAddress(key.PublicKey)
 
-	receiver := crypto.PubkeyToAddress(key2.PublicKey)
-
 	balance := new(big.Int).Mul(big.NewInt(50), common.DnaBase)
-	stake := new(big.Int).Mul(big.NewInt(100), common.DnaBase)
+	stake := new(big.Int).Mul(big.NewInt(10000), common.DnaBase)
 
 	account := appState.State.GetOrNewAccountObject(sender)
 	account.SetBalance(balance)
@@ -151,26 +145,49 @@ func Test_ApplyKillTx(t *testing.T) {
 	id.SetStake(stake)
 	id.SetState(state.Invite)
 
-	amount := new(big.Int).Mul(big.NewInt(1), common.DnaBase)
+	chain.appState.State.SetFeePerGas(new(big.Int).Div(big.NewInt(1e+18), big.NewInt(1000)))
 
 	tx := &types.Transaction{
 		Type:         types.KillTx,
-		Amount:       amount,
+		Amount:       big.NewInt(1),
 		AccountNonce: 1,
-		To:           &receiver,
 	}
 
 	signed, _ := types.SignTx(tx, key)
 
-	chain.appState.State.SetFeePerByte(new(big.Int).Div(big.NewInt(1e+18), big.NewInt(1000)))
-	fee := fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerByte(), tx)
+	fee := fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerGas(), tx)
+	require.Equal(big.NewInt(0), fee)
+	require.Error(validation.ValidateTx(chain.appState, signed, fee2.MinFeePerGas, validation.InBlockTx), "should return error if amount is not zero")
 
-	chain.ApplyTxOnState(chain.appState, signed, nil)
+	tx2 := &types.Transaction{
+		Type:         types.KillTx,
+		Amount:       big.NewInt(1),
+		AccountNonce: 1,
+		To:           &common.Address{0x1},
+	}
 
+	signed2, _ := types.SignTx(tx2, key)
+
+	fee = fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerGas(), tx2)
+	require.Equal(big.NewInt(0), fee)
+	require.Error(validation.ValidateTx(chain.appState, signed2, fee2.MinFeePerGas, validation.InBlockTx), "should return error if *to is filled")
+
+	tx3 := &types.Transaction{
+		Type:         types.KillTx,
+		AccountNonce: 1,
+	}
+
+	signed3, _ := types.SignTx(tx3, key)
+
+	fee = fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerGas(), tx3)
+
+	require.NoError(validation.ValidateTx(chain.appState, signed3, fee2.MinFeePerGas, validation.InBlockTx))
+	chain.ApplyTxOnState(chain.appState, nil, signed3, nil)
+
+	require.Equal(big.NewInt(0), fee)
 	require.Equal(state.Killed, appState.State.GetIdentityState(sender))
-	require.Equal(new(big.Int).Sub(balance, amount), appState.State.GetBalance(sender))
-
-	require.Equal(new(big.Int).Add(new(big.Int).Sub(stake, fee), amount), appState.State.GetBalance(receiver))
+	require.Equal(new(big.Int).Add(balance, stake), appState.State.GetBalance(sender))
+	require.True(common.ZeroOrNil(appState.State.GetStakeBalance(sender)))
 }
 
 func Test_ApplyDoubleKillTx(t *testing.T) {
@@ -178,9 +195,7 @@ func Test_ApplyDoubleKillTx(t *testing.T) {
 	chain, appState, _, _ := NewTestBlockchain(true, nil)
 
 	key, _ := crypto.GenerateKey()
-	key2, _ := crypto.GenerateKey()
 	sender := crypto.PubkeyToAddress(key.PublicKey)
-	receiver := crypto.PubkeyToAddress(key2.PublicKey)
 
 	stake := new(big.Int).Mul(big.NewInt(100), common.DnaBase)
 
@@ -191,27 +206,25 @@ func Test_ApplyDoubleKillTx(t *testing.T) {
 	tx1 := &types.Transaction{
 		Type:         types.KillTx,
 		AccountNonce: 1,
-		To:           &receiver,
 		MaxFee:       common.DnaBase,
 	}
 	tx2 := &types.Transaction{
 		Type:         types.KillTx,
 		AccountNonce: 2,
-		To:           &receiver,
 		MaxFee:       common.DnaBase,
 	}
 
 	signedTx1, _ := types.SignTx(tx1, key)
 	signedTx2, _ := types.SignTx(tx2, key)
 
-	chain.appState.State.SetFeePerByte(fee2.MinFeePerByte)
-	require.Nil(validation.ValidateTx(chain.appState, signedTx1, fee2.MinFeePerByte, validation.InBlockTx))
-	require.Nil(validation.ValidateTx(chain.appState, signedTx2, fee2.MinFeePerByte, validation.InBlockTx))
+	chain.appState.State.SetFeePerGas(fee2.MinFeePerGas)
+	require.Nil(validation.ValidateTx(chain.appState, signedTx1, fee2.MinFeePerGas, validation.InBlockTx))
+	require.Nil(validation.ValidateTx(chain.appState, signedTx2, fee2.MinFeePerGas, validation.InBlockTx))
 
-	_, err := chain.ApplyTxOnState(chain.appState, signedTx1, nil)
+	_, _, err := chain.ApplyTxOnState(chain.appState, nil, signedTx1, nil)
 
 	require.Nil(err)
-	require.Equal(validation.InsufficientFunds, validation.ValidateTx(chain.appState, signedTx2, fee2.MinFeePerByte, validation.InBlockTx))
+	require.Equal(validation.InvalidSender, validation.ValidateTx(chain.appState, signedTx2, fee2.MinFeePerGas, validation.InBlockTx))
 }
 
 func Test_ApplyKillInviteeTx(t *testing.T) {
@@ -237,14 +250,32 @@ func Test_ApplyKillInviteeTx(t *testing.T) {
 	tx := &types.Transaction{
 		Type:         types.KillInviteeTx,
 		AccountNonce: 1,
-		To:           &invitee,
 	}
 	signedTx, _ := types.SignTx(tx, inviterKey)
+	require.Error(t, validation.ValidateTx(chain.appState, signedTx, fee2.MinFeePerGas, validation.InBlockTx), "should return error if *to is not filled")
 
-	chain.appState.State.SetFeePerByte(new(big.Int).Div(big.NewInt(1e+18), big.NewInt(1000)))
-	fee := fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerByte(), tx)
+	tx2 := &types.Transaction{
+		Type:         types.KillInviteeTx,
+		AccountNonce: 1,
+		Amount:       new(big.Int).Mul(big.NewInt(9), common.DnaBase),
+		To:           &invitee,
+	}
+	signedTx2, _ := types.SignTx(tx2, inviterKey)
+	require.Error(t, validation.ValidateTx(chain.appState, signedTx2, fee2.MinFeePerGas, validation.InBlockTx), "should return error if amount is not zero")
 
-	chain.ApplyTxOnState(chain.appState, signedTx, nil)
+	tx3 := &types.Transaction{
+		Type:         types.KillInviteeTx,
+		AccountNonce: 1,
+		To:           &invitee,
+		MaxFee:       new(big.Int).Mul(big.NewInt(2), common.DnaBase),
+	}
+	signedTx3, _ := types.SignTx(tx3, inviterKey)
+	require.NoError(t, validation.ValidateTx(chain.appState, signedTx3, fee2.MinFeePerGas, validation.InBlockTx))
+
+	chain.appState.State.SetFeePerGas(new(big.Int).Div(big.NewInt(1e+18), big.NewInt(1000)))
+	fee := fee2.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), chain.appState.State.FeePerGas(), tx3)
+
+	chain.ApplyTxOnState(chain.appState, nil, signedTx3, nil)
 
 	require.Equal(t, uint8(0), appState.State.GetInvites(inviter))
 	require.Equal(t, 1, len(appState.State.GetInvitees(inviter)))
@@ -252,6 +283,7 @@ func Test_ApplyKillInviteeTx(t *testing.T) {
 	newBalance := new(big.Int).Mul(big.NewInt(60), common.DnaBase)
 	newBalance.Sub(newBalance, fee)
 	require.Equal(t, newBalance, appState.State.GetBalance(inviter))
+	require.True(t, common.ZeroOrNil(appState.State.GetStakeBalance(invitee)))
 
 	require.Equal(t, state.Killed, appState.State.GetIdentityState(invitee))
 	require.Nil(t, appState.State.GetInviter(invitee))
@@ -312,18 +344,26 @@ func Test_applyNextBlockFee(t *testing.T) {
 
 	appState, _ := chain.appState.ForCheck(1)
 
-	block := generateBlock(4, 10000) // block size 770008
-	chain.applyNextBlockFee(appState, block)
-	require.Equal(t, big.NewInt(105858421325683595), appState.State.FeePerByte())
+	block := generateBlock(4, 4000)
+	var usedGas uint64
+	for _, tx := range block.Body.Transactions {
+		usedGas += uint64(fee2.CalculateGas(tx))
+	}
+	chain.applyNextBlockFee(appState, block, usedGas)
+	require.Equal(t, big.NewInt(10996093750000000), appState.State.FeePerGas())
 
-	block = generateBlock(5, 5000) // block size 385008
-	chain.applyNextBlockFee(appState, block)
-	require.Equal(t, big.NewInt(102343187112273882), appState.State.FeePerByte())
+	block = generateBlock(5, 1500)
+	usedGas = 0
+	for _, tx := range block.Body.Transactions {
+		usedGas += uint64(fee2.CalculateGas(tx))
+	}
+	chain.applyNextBlockFee(appState, block, usedGas)
+	require.Equal(t, big.NewInt(10547766685485839), appState.State.FeePerGas())
 
 	block = generateBlock(6, 0)
-	chain.applyNextBlockFee(appState, block)
-	// 0.1 / networkSize, where networkSize is 0, feePerByte = 0.1 DNA
-	require.Equal(t, new(big.Int).Div(common.DnaBase, big.NewInt(10)), appState.State.FeePerByte())
+	chain.applyNextBlockFee(appState, block, 0)
+	// 0.01 / networkSize, where networkSize is 0, feePerGas = 0.01 DNA
+	require.Equal(t, new(big.Int).Div(common.DnaBase, big.NewInt(100)), appState.State.FeePerGas())
 }
 
 func Test_applyVrfProposerThreshold(t *testing.T) {
@@ -341,7 +381,7 @@ func Test_applyVrfProposerThreshold(t *testing.T) {
 
 type txWithTimestamp struct {
 	tx        *types.Transaction
-	timestamp uint64
+	timestamp int64
 }
 
 func generateBlock(height uint64, txsCount int) *types.Block {
@@ -410,12 +450,12 @@ func Test_ApplyBurnTx(t *testing.T) {
 	signedTx, _ := types.SignTx(tx, senderKey)
 
 	appState := chain.appState
-	appState.State.SetFeePerByte(new(big.Int).Div(common.DnaBase, big.NewInt(1000)))
-	fee := fee2.CalculateFee(appState.ValidatorsCache.NetworkSize(), appState.State.FeePerByte(), tx)
+	appState.State.SetFeePerGas(new(big.Int).Div(common.DnaBase, big.NewInt(1000)))
+	fee := fee2.CalculateFee(appState.ValidatorsCache.NetworkSize(), appState.State.FeePerGas(), tx)
 	expectedBalance := new(big.Int).Mul(big.NewInt(89), common.DnaBase)
 	expectedBalance.Sub(expectedBalance, fee)
 
-	chain.ApplyTxOnState(appState, signedTx, nil)
+	chain.ApplyTxOnState(appState, nil, signedTx, nil)
 
 	require.Equal(t, 1, fee.Sign())
 	require.Equal(t, expectedBalance, appState.State.GetBalance(sender))
@@ -447,13 +487,13 @@ func Test_DeleteFlipTx(t *testing.T) {
 	appState.State.AddFlip(sender, []byte{0x1, 0x2, 0x2}, 0)
 	appState.State.AddFlip(sender, []byte{0x1, 0x2, 0x3}, 1)
 	appState.State.AddFlip(sender, []byte{0x1, 0x2, 0x4}, 2)
-	appState.State.SetFeePerByte(big.NewInt(1))
+	appState.State.SetFeePerGas(big.NewInt(1))
 
-	fee := fee2.CalculateFee(appState.ValidatorsCache.NetworkSize(), appState.State.FeePerByte(), tx)
+	fee := fee2.CalculateFee(appState.ValidatorsCache.NetworkSize(), appState.State.FeePerGas(), tx)
 	expectedBalance := big.NewInt(999_990)
 	expectedBalance.Sub(expectedBalance, fee)
 
-	chain.ApplyTxOnState(appState, signedTx, nil)
+	chain.ApplyTxOnState(appState, nil, signedTx, nil)
 
 	require.Equal(t, 1, fee.Sign())
 	require.Equal(t, expectedBalance, appState.State.GetBalance(sender))
@@ -654,25 +694,41 @@ func Test_setNewIdentitiesAttributes(t *testing.T) {
 	_, s := NewCustomTestBlockchain(5, 0, key)
 
 	identities := []state.Identity{
-		{State: state.Human, ShortFlipPoints: 98, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 83, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 85, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 88, QualifiedFlips: 100},
-		{State: state.Human, ShortFlipPoints: 92, QualifiedFlips: 100},
-		{State: state.Human, ShortFlipPoints: 94, QualifiedFlips: 100},
-		{State: state.Human, ShortFlipPoints: 94, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 83, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 82, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 81, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 81, QualifiedFlips: 100},
-		{State: state.Verified, ShortFlipPoints: 81, QualifiedFlips: 100},
+		// 98%
+		{Code: []byte{0x1}, State: state.Human, Scores: []byte{common.EncodeScore(6, 6), common.EncodeScore(6, 6), common.EncodeScore(6, 6), common.EncodeScore(5.5, 6)}},
+		// 83%
+		{Code: []byte{0x2}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6)}},
+		// 85%
+		{Code: []byte{0x3}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(5.5, 6), common.EncodeScore(4, 5)}},
+		// 89%
+		{Code: []byte{0x4}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(5, 6), common.EncodeScore(6, 6)}},
+		// 92%
+		{Code: []byte{0x5}, State: state.Human, Scores: []byte{common.EncodeScore(5, 5), common.EncodeScore(5.5, 6), common.EncodeScore(5.5, 6), common.EncodeScore(5.5, 6), common.EncodeScore(4.5, 5)}},
+		// 81%
+		{Code: []byte{0x6}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(4.5, 6), common.EncodeScore(4.5, 5), common.EncodeScore(4.5, 6), common.EncodeScore(5, 6)}},
+		// 94%
+		{Code: []byte{0x7}, State: state.Human, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(6, 6), common.EncodeScore(6, 6)}},
+		// 94%
+		{Code: []byte{0x8}, State: state.Human, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(6, 6), common.EncodeScore(6, 6)}},
+		// 83%
+		{Code: []byte{0x9}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6)}},
+		// 82%
+		{Code: []byte{0xa}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(4.5, 6), common.EncodeScore(4.5, 5)}},
+		// 81%
+		{Code: []byte{0xb}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(4.5, 6), common.EncodeScore(4.5, 5), common.EncodeScore(4.5, 6), common.EncodeScore(5, 6)}},
+		// 81%
+		{Code: []byte{0xc}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(4.5, 6), common.EncodeScore(4.5, 5), common.EncodeScore(4.5, 6), common.EncodeScore(5, 6)}},
+		// 94%
+		{Code: []byte{0xd}, State: state.Verified, Scores: []byte{common.EncodeScore(5, 6), common.EncodeScore(6, 6), common.EncodeScore(6, 6)}},
 	}
 
-	for i, item := range identities {
-		addr := common.Address{byte(i + 1)}
+	for _, item := range identities {
+		var addr common.Address
+		copy(addr[:], item.Code)
 		s.State.SetState(addr, item.State)
-		s.State.AddShortFlipPoints(addr, float32(item.ShortFlipPoints))
-		s.State.AddQualifiedFlipsCount(addr, item.QualifiedFlips)
+		for _, score := range item.Scores {
+			s.State.AddNewScore(addr, score)
+		}
 	}
 	s.Commit(nil)
 
@@ -680,40 +736,67 @@ func Test_setNewIdentitiesAttributes(t *testing.T) {
 
 	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
 	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x5}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x7}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x8}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xd}))
 	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x2}))
-	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x8}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x3}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x4}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x9}))
 
 	s.Reset()
 	setNewIdentitiesAttributes(s, 1, 100, false, &types.ValidationResults{}, nil)
-	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
-	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x2}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x7}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x8}))
 
 	s.Reset()
 	setNewIdentitiesAttributes(s, 5, 100, false, &types.ValidationResults{}, nil)
 	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
-	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x6}))
-	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x7}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x5}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x7}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x8}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0xd}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x4}))
 
 	s.Reset()
-	setNewIdentitiesAttributes(s, 14, 100, false, &types.ValidationResults{}, nil)
+	setNewIdentitiesAttributes(s, 15, 100, false, &types.ValidationResults{}, nil)
 	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x5}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x4}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x6}))
 	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xa}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xb}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xc}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xd}))
 
 	s.Reset()
 	setNewIdentitiesAttributes(s, 20, 100, false, &types.ValidationResults{}, nil)
 	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
-	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x6}))
-	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x4}))
-	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x9}))
-	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xa}))
-
-	s.Reset()
-	setNewIdentitiesAttributes(s, 14, 100, false, &types.ValidationResults{}, nil)
-	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
 	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x5}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x4}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x6}))
 	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xa}))
 	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xb}))
 	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xc}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xd}))
+
+	s.Reset()
+	setNewIdentitiesAttributes(s, 2, 100, false, &types.ValidationResults{}, nil)
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x7}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x8}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0xd}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x5}))
+
+	s.Reset()
+	setNewIdentitiesAttributes(s, 6, 100, false, &types.ValidationResults{}, nil)
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x1}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x7}))
+	require.Equal(uint8(2), s.State.GetInvites(common.Address{0x8}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0x5}))
+	require.Equal(uint8(1), s.State.GetInvites(common.Address{0xd}))
+	require.Equal(uint8(0), s.State.GetInvites(common.Address{0x4}))
 }
 
 func Test_ClearDustAccounts(t *testing.T) {

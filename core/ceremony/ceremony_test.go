@@ -11,7 +11,6 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/crypto"
-	"github.com/idena-network/idena-go/rlp"
 	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/stretchr/testify/require"
 	dbm "github.com/tendermint/tm-db"
@@ -109,32 +108,32 @@ func Test_determineNewIdentityState(t *testing.T) {
 		},
 		{
 			state.Candidate,
-			MinShortScore, MinLongScore, MinTotalScore, 11, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 11, false,
 			state.Newbie, false, false,
 		},
 		{
 			state.Candidate,
-			MinShortScore, MinLongScore, MinTotalScore, 11, true,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 11, true,
 			state.Killed, false, false,
 		},
 		{
 			state.Newbie,
-			MinShortScore, MinLongScore, MinTotalScore, 11, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 11, false,
 			state.Newbie, false, false,
 		},
 		{
 			state.Newbie,
-			MinShortScore, MinLongScore, MinTotalScore, 13, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 13, false,
 			state.Verified, false, false,
 		},
 		{
 			state.Newbie,
-			MinShortScore, MinLongScore, MinTotalScore, 10, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 10, false,
 			state.Newbie, false, false,
 		},
 		{
 			state.Newbie,
-			MinShortScore, MinLongScore, MinTotalScore, 11, true,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 11, true,
 			state.Killed, false, false,
 		},
 		{
@@ -144,12 +143,12 @@ func Test_determineNewIdentityState(t *testing.T) {
 		},
 		{
 			state.Newbie,
-			MinShortScore, MinLongScore, MinTotalScore, 8, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 8, false,
 			state.Newbie, false, false,
 		},
 		{
 			state.Verified,
-			MinShortScore, MinLongScore, MinTotalScore, 10, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 10, false,
 			state.Killed, false, false,
 		},
 		{
@@ -164,7 +163,7 @@ func Test_determineNewIdentityState(t *testing.T) {
 		},
 		{
 			state.Suspended,
-			MinShortScore, MinLongScore, MinTotalScore, 10, false,
+			common.MinShortScore, common.MinLongScore, common.MinTotalScore, 10, false,
 			state.Verified, false, false,
 		},
 		{
@@ -174,7 +173,7 @@ func Test_determineNewIdentityState(t *testing.T) {
 		},
 		{
 			state.Zombie,
-			MinShortScore, 0, MinTotalScore, 10, false,
+			common.MinShortScore, 0, common.MinTotalScore, 10, false,
 			state.Verified, false, false,
 		},
 		{
@@ -184,123 +183,133 @@ func Test_determineNewIdentityState(t *testing.T) {
 		},
 		{
 			state.Candidate,
-			MinShortScore, 0, 0, 5, false,
+			common.MinShortScore, 0, 0, 5, false,
 			state.Candidate, true, false,
 		},
 		{
 			state.Candidate,
-			MinShortScore - 0.1, 0, 0, 5, false,
+			common.MinShortScore - 0.1, 0, 0, 5, false,
 			state.Killed, false, true,
 		},
 		{
 			state.Newbie,
-			MinShortScore, 0, 0.1, 5, false,
+			common.MinShortScore, 0, 0.1, 5, false,
 			state.Newbie, true, false,
 		},
 		{
 			state.Newbie,
-			MinShortScore, 0, 0.1, 5, false,
+			common.MinShortScore, 0, 0.1, 5, false,
 			state.Newbie, false, true,
 		},
 		{
 			state.Newbie,
-			MinShortScore, 0, 0.1, 13, false,
+			common.MinShortScore, 0, 0.1, 13, false,
 			state.Killed, false, true,
 		},
 		{
 			state.Newbie,
-			MinShortScore - 0.1, 0, 0.1, 9, false,
+			common.MinShortScore - 0.1, 0, 0.1, 9, false,
 			state.Killed, false, true,
 		},
 		{
 			state.Verified,
-			MinShortScore - 0.1, 0, 0.1, 10, false,
+			common.MinShortScore - 0.1, 0, 0.1, 10, false,
 			state.Verified, true, false,
 		},
 		{
 			state.Verified,
-			MinShortScore - 0.1, 0, 1.1, 10, false,
+			common.MinShortScore - 0.1, 0, 1.1, 10, false,
 			state.Killed, false, true,
 		},
 		{
 			state.Suspended,
-			MinShortScore - 0.1, 0, 0.1, 10, false,
+			common.MinShortScore - 0.1, 0, 0.1, 10, false,
 			state.Suspended, true, false,
 		},
 		{
 			state.Suspended,
-			MinShortScore - 0.1, 0, 1.1, 10, false,
+			common.MinShortScore - 0.1, 0, 1.1, 10, false,
 			state.Killed, false, true,
 		},
 		{
 			state.Zombie,
-			MinShortScore - 0.1, 0, 0.1, 10, false,
+			common.MinShortScore - 0.1, 0, 0.1, 10, false,
 			state.Zombie, true, false,
 		},
 		{
 			state.Zombie,
-			MinShortScore, 0, 0.1, 10, false,
+			common.MinShortScore, 0, 0.1, 10, false,
 			state.Killed, false, true,
 		},
 		{
 			state.Suspended,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 24, false,
 			state.Human, false, false,
 		},
 		{
 			state.Suspended,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 23, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 23, false,
 			state.Verified, false, false,
 		},
 		{
 			state.Zombie,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 24, false,
 			state.Human, false, false,
 		},
 		{
 			state.Zombie,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 23, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 23, false,
 			state.Verified, false, false,
 		},
 		{
 			state.Human,
-			0.1, MinLongScore, MinHumanTotalScore, 24, false,
+			0.1, common.MinLongScore, common.MinHumanTotalScore, 24, false,
 			state.Suspended, false, false,
 		},
 		{
 			state.Human,
-			MinShortScore, 0.1, MinHumanTotalScore, 24, false,
-			state.Killed, false, false,
+			common.MinShortScore, 0.1, common.MinHumanTotalScore, 24, false,
+			state.Suspended, false, false,
 		},
 		{
 			state.Human,
-			0.1, 0.1, MinHumanTotalScore, 24, false,
+			0.1, 0.1, common.MinHumanTotalScore, 24, false,
 			state.Suspended, false, true,
 		},
 		{
 			state.Human,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 24, false,
 			state.Human, false, true,
 		},
 		{
 			state.Human,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 24, true,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 24, true,
 			state.Suspended, false, false,
 		},
 		{
 			state.Human,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 24, false,
 			state.Human, true, true,
 		},
 		{
 			state.Verified,
-			MinShortScore, MinLongScore, MinHumanTotalScore, 24, false,
+			common.MinShortScore, common.MinLongScore, common.MinHumanTotalScore, 24, false,
 			state.Human, false, false,
+		},
+		{
+			state.Human,
+			0, 0, common.MinHumanTotalScore, 24, false,
+			state.Suspended, false, false,
+		},
+
+		{
+			state.Human,
+			0, 0, 0.74, 24, false,
+			state.Killed, false, false,
 		},
 	}
 
 	require := require.New(t)
-
 	for i, c := range cases {
 		require.Equal(c.expected, determineNewIdentityState(state.Identity{State: c.prev}, c.shortScore, c.longScore, c.totalScore, c.totalQualifiedFlips, c.missed, c.noQualShort, c.noQualLong), "index = %v", i)
 	}
@@ -341,8 +350,10 @@ func Test_getNotApprovedFlips(t *testing.T) {
 	app.State.SetRequiredFlips(approvedAddr, 3)
 
 	vc.candidates = candidates
-	vc.flips = flips
-	vc.flipsPerAuthor = flipsPerAuthor
+	vc.flipsData = &flipsData{
+		allFlips:       flips,
+		flipsPerAuthor: flipsPerAuthor,
+	}
 	vc.appState = app
 
 	approvedCandidates := mapset.NewSet()
@@ -381,62 +392,126 @@ func Test_analyzeAuthors(t *testing.T) {
 	auth4 := common.Address{4}
 	auth5 := common.Address{5}
 	auth6 := common.Address{6}
+	auth7 := common.Address{7}
+	auth8 := common.Address{8}
+	auth9 := common.Address{9}
+	auth10 := common.Address{10}
+	auth11 := common.Address{11}
 
-	vc.flips = [][]byte{{0x0}, {0x1}, {0x2}, {0x3}, {0x4}, {0x5}, {0x6}, {0x7}, {0x8}, {0x9}, {0xa}, {0xb}, {0xc}}
-	vc.flipAuthorMap = map[common.Hash]common.Address{
-		rlp.Hash([]byte{0x0}): auth1,
-		rlp.Hash([]byte{0x1}): auth1,
-		rlp.Hash([]byte{0x2}): auth1,
+	reporter1 := common.Address{12}
+	reporter2 := common.Address{13}
+	reporter3 := common.Address{14}
 
-		rlp.Hash([]byte{0x3}): auth2,
-		rlp.Hash([]byte{0x4}): auth2,
+	vc.flipsData = &flipsData{}
 
-		rlp.Hash([]byte{0x5}): auth3,
-		rlp.Hash([]byte{0x6}): auth3,
+	vc.flipsData.allFlips = [][]byte{{0x0}, {0x1}, {0x2}, {0x3}, {0x4}, {0x5}, {0x6}, {0x7}, {0x8}, {0x9}, {0xa}, {0xb}, {0xc},
+		{0xd}, {0xe}, {0xf}, {0x10}, {0x11}, {0x12}, {0x13}, {0x14}, {0x15}, {0x16}}
+	vc.flipsData.flipAuthorMap = map[string]common.Address{
+		string([]byte{0x0}): auth1,
+		string([]byte{0x1}): auth1,
+		string([]byte{0x2}): auth1,
 
-		rlp.Hash([]byte{0x7}): auth4,
-		rlp.Hash([]byte{0x8}): auth4,
+		string([]byte{0x3}): auth2,
+		string([]byte{0x4}): auth2,
 
-		rlp.Hash([]byte{0x9}): auth5,
+		string([]byte{0x5}): auth3,
+		string([]byte{0x6}): auth3,
 
-		rlp.Hash([]byte{0xa}): auth6,
-		rlp.Hash([]byte{0xb}): auth6,
-		rlp.Hash([]byte{0xc}): auth6,
+		string([]byte{0x7}): auth4,
+		string([]byte{0x8}): auth4,
+
+		string([]byte{0x9}): auth5,
+
+		string([]byte{0xa}): auth6,
+		string([]byte{0xb}): auth6,
+		string([]byte{0xc}): auth6,
+
+		string([]byte{0xd}): auth7,
+		string([]byte{0xe}): auth7,
+
+		string([]byte{0xf}):  auth8,
+		string([]byte{0x10}): auth8,
+
+		string([]byte{0x11}): auth9,
+		string([]byte{0x12}): auth9,
+
+		string([]byte{0x13}): auth10,
+		string([]byte{0x14}): auth10,
+
+		string([]byte{0x15}): auth11,
+		string([]byte{0x16}): auth11,
 	}
 
 	qualification := []FlipQualification{
-		{status: Qualified},
-		{status: WeaklyQualified},
-		{status: NotQualified},
+		{status: Qualified, grade: types.GradeD},
+		{status: WeaklyQualified, grade: types.GradeC},
+		{status: NotQualified, grade: types.GradeD},
 
-		{status: Qualified, answer: types.Inappropriate},
-		{status: Qualified},
+		{status: QualifiedByNone, grade: types.GradeD},
+		{status: Qualified, grade: types.GradeD},
 
-		{status: WeaklyQualified, wrongWords: true},
-		{status: Qualified},
+		{status: WeaklyQualified, grade: types.GradeReported},
+		{status: Qualified, grade: types.GradeD},
 
-		{status: NotQualified},
-		{status: NotQualified},
+		{status: NotQualified, grade: types.GradeD},
+		{status: NotQualified, grade: types.GradeD},
 
-		{status: QualifiedByNone},
+		{status: QualifiedByNone, grade: types.GradeD},
 
-		{status: Qualified},
-		{status: WeaklyQualified},
-		{status: Qualified},
+		{status: Qualified, grade: types.GradeD},
+		{status: WeaklyQualified, grade: types.GradeD},
+		{status: Qualified, grade: types.GradeD},
+
+		{status: NotQualified, grade: types.GradeReported},
+		{status: Qualified, grade: types.GradeA},
+
+		{status: Qualified, grade: types.GradeReported},
+		{status: NotQualified, grade: types.GradeA},
+
+		{status: QualifiedByNone, grade: types.GradeReported},
+		{status: Qualified, grade: types.GradeA},
+
+		{status: NotQualified, grade: types.GradeReported},
+		{status: NotQualified, grade: types.GradeC},
+
+		{status: WeaklyQualified, grade: types.GradeReported},
+		{status: QualifiedByNone, grade: types.GradeA},
 	}
+	reporters := newReportersToReward()
+	reporters.addReport(5, reporter1)
+	reporters.addReport(5, auth2)
+	reporters.addReport(13, reporter1)
+	reporters.addReport(13, reporter2)
+	reporters.addReport(15, reporter1)
+	reporters.addReport(15, reporter3)
+	reporters.addReport(15, auth2)
+	reporters.addReport(17, reporter1)
+	reporters.addReport(17, reporter2)
+	reporters.addReport(17, reporter3)
+	reporters.addReport(19, reporter2)
+	reporters.addReport(19, reporter3)
+	reporters.addReport(21, reporter1)
+	reporters.addReport(21, reporter2)
 
-	bad, good, authorResults := vc.analyzeAuthors(qualification)
+	bad, good, authorResults, madeFlips, reporters := vc.analyzeAuthors(qualification, reporters)
 
 	require.Contains(t, bad, auth2)
 	require.Contains(t, bad, auth3)
 	require.Contains(t, bad, auth4)
 	require.Contains(t, bad, auth5)
+	require.Contains(t, bad, auth7)
+	require.Contains(t, bad, auth8)
+	require.Contains(t, bad, auth9)
+	require.Contains(t, bad, auth10)
 	require.NotContains(t, bad, auth1)
 	require.NotContains(t, bad, auth6)
 
 	require.Contains(t, good, auth1)
-	require.Equal(t, 1, len(good[auth1].WeakFlipCids))
-	require.Equal(t, 1, len(good[auth1].StrongFlipCids))
+	require.Equal(t, 2, len(good[auth1].FlipsToReward))
+	require.Equal(t, types.GradeD, good[auth1].FlipsToReward[0].Grade)
+	require.Equal(t, []byte{0x0}, good[auth1].FlipsToReward[0].Cid)
+	require.Equal(t, types.GradeC, good[auth1].FlipsToReward[1].Grade)
+	require.Equal(t, []byte{0x1}, good[auth1].FlipsToReward[1].Cid)
 
 	require.True(t, authorResults[auth1].HasOneNotQualifiedFlip)
 	require.False(t, authorResults[auth1].AllFlipsNotQualified)
@@ -453,6 +528,31 @@ func Test_analyzeAuthors(t *testing.T) {
 	require.True(t, authorResults[auth4].HasOneNotQualifiedFlip)
 	require.True(t, authorResults[auth4].AllFlipsNotQualified)
 	require.False(t, authorResults[auth4].HasOneReportedFlip)
+
+	require.False(t, authorResults[auth9].HasOneNotQualifiedFlip)
+	require.False(t, authorResults[auth9].AllFlipsNotQualified)
+	require.True(t, authorResults[auth9].HasOneReportedFlip)
+
+	require.Equal(t, 11, len(madeFlips))
+
+	require.Equal(t, 2, len(reporters.reportersByFlip))
+	require.Equal(t, 1, len(reporters.reportersByFlip[5]))
+	require.Equal(t, reporter1, reporters.reportersByFlip[5][reporter1].Address)
+	require.Equal(t, 2, len(reporters.reportersByFlip[15]))
+	require.Equal(t, reporter1, reporters.reportersByFlip[15][reporter1].Address)
+	require.Equal(t, reporter3, reporters.reportersByFlip[15][reporter3].Address)
+
+	require.Equal(t, 2, len(reporters.reportersByAddr))
+	require.Equal(t, reporter1, reporters.reportersByAddr[reporter1].Address)
+	require.Equal(t, reporter3, reporters.reportersByAddr[reporter3].Address)
+
+	require.Equal(t, 2, len(reporters.reportedFlipsByReporter))
+	require.Equal(t, 2, len(reporters.reportedFlipsByReporter[reporter1]))
+	require.Contains(t, reporters.reportedFlipsByReporter[reporter1], 5)
+	require.Contains(t, reporters.reportedFlipsByReporter[reporter1], 15)
+	require.Equal(t, 1, len(reporters.reportedFlipsByReporter[reporter3]))
+	require.Contains(t, reporters.reportedFlipsByReporter[reporter3], 15)
+
 }
 
 func Test_incSuccessfulInvites(t *testing.T) {
@@ -556,13 +656,14 @@ func Test_determineIdentityBirthday(t *testing.T) {
 
 func Test_applyOnState(t *testing.T) {
 	db := dbm.NewMemDB()
-	appstate := appstate.NewAppState(db, eventbus.New())
+	appstate, _ := appstate.NewAppState(db, eventbus.New())
 
 	addr1 := common.Address{0x1}
 
 	appstate.State.SetState(addr1, state.Newbie)
 	appstate.State.AddStake(addr1, big.NewInt(100))
 	appstate.State.AddBalance(addr1, big.NewInt(10))
+	appstate.State.AddNewScore(addr1, common.EncodeScore(5, 6))
 
 	identities := applyOnState(appstate, collector.NewStatsCollector(), addr1, cacheValue{
 		prevState:                state.Newbie,
@@ -575,8 +676,87 @@ func Test_applyOnState(t *testing.T) {
 	require.Equal(t, 1, identities)
 	require.Equal(t, state.Verified, identity.State)
 	require.Equal(t, uint16(3), identity.Birthday)
-	require.Equal(t, float32(1), identity.GetShortFlipPoints())
-	require.Equal(t, uint32(2), identity.QualifiedFlips)
+	require.Equal(t, []byte{common.EncodeScore(5, 6), common.EncodeScore(1, 2)}, identity.Scores)
 	require.True(t, appstate.State.GetBalance(addr1).Cmp(big.NewInt(85)) == 0)
 	require.True(t, appstate.State.GetStakeBalance(addr1).Cmp(big.NewInt(25)) == 0)
+
+	applyOnState(appstate, collector.NewStatsCollector(), addr1, cacheValue{
+		shortFlipPoint:           0,
+		shortQualifiedFlipsCount: 0,
+		missed:                   true,
+	})
+	identity = appstate.State.GetIdentity(addr1)
+	require.Equal(t, []byte{common.EncodeScore(5, 6), common.EncodeScore(1, 2)}, identity.Scores)
+}
+
+func Test_calculateNewTotalScore(t *testing.T) {
+	var a float32
+	var b uint32
+
+	a, b = calculateNewTotalScore([]byte{}, 4, 6, 0, 0)
+	require.Equal(t, float32(4)/6, a)
+	require.Equal(t, uint32(6), b)
+
+	a, b = calculateNewTotalScore([]byte{}, 4, 6, 140, 145)
+	require.Equal(t, float32(130)/137, a)
+	require.Equal(t, uint32(137), b)
+
+	a, b = calculateNewTotalScore([]byte{common.EncodeScore(3, 5)}, 5, 6, 150, 163)
+	require.Equal(t, float32(128)/141, a)
+	require.Equal(t, uint32(141), b)
+
+	a, b = calculateNewTotalScore([]byte{common.EncodeScore(4, 6)}, 3.5, 6, 237.5, 255)
+	require.Equal(t, float32(197.5)/216, a)
+	require.Equal(t, uint32(216), b)
+
+	a, b = calculateNewTotalScore([]byte{
+		common.EncodeScore(4, 6),
+		common.EncodeScore(3.5, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(6, 6),
+	}, 4, 5, 237.5, 255)
+	require.Equal(t, float32(141.25)/157, a)
+	require.Equal(t, uint32(157), b)
+
+	a, b = calculateNewTotalScore([]byte{
+		common.EncodeScore(4, 6),
+		common.EncodeScore(3.5, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(6, 6),
+		common.EncodeScore(4, 5),
+		common.EncodeScore(6, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(4, 5),
+	}, 4, 6, 237.5, 255)
+	require.Equal(t, float32(65.25)/78, a)
+	require.Equal(t, uint32(78), b)
+
+	a, b = calculateNewTotalScore([]byte{
+		common.EncodeScore(4, 6),
+		common.EncodeScore(3.5, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(6, 6),
+		common.EncodeScore(4, 5),
+		common.EncodeScore(6, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(4, 5),
+		common.EncodeScore(4, 6),
+	}, 6, 6, 237.5, 255)
+	require.Equal(t, float32(47.5)/58, a)
+	require.Equal(t, uint32(58), b)
+
+	a, b = calculateNewTotalScore([]byte{
+		common.EncodeScore(4, 6),
+		common.EncodeScore(3.5, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(6, 6),
+		common.EncodeScore(4, 5),
+		common.EncodeScore(6, 6),
+		common.EncodeScore(5, 6),
+		common.EncodeScore(4, 5),
+		common.EncodeScore(4, 6),
+		common.EncodeScore(6, 6),
+	}, 5, 5, 237.5, 255)
+	require.Equal(t, float32(48.5)/57, a)
+	require.Equal(t, uint32(57), b)
 }

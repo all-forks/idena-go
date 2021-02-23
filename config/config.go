@@ -80,35 +80,36 @@ func (c *Config) ProvideNodeKey(key string, password string, withBackup bool) er
 	return nil
 }
 
-func (c *Config) NodeKey() *ecdsa.PrivateKey {
+func (c *Config) NodeKey() (*ecdsa.PrivateKey, error) {
 	// Generate ephemeral key if no datadir is being used.
 	if c.DataDir == "" {
 		key, err := crypto.GenerateKey()
-		if err != nil {
-			log.Crit(fmt.Sprintf("Failed to generate ephemeral node key: %v", err))
-		}
-		return key
+		return key, errors.Wrap(err, "failed to generate ephemeral node key")
 	}
 
 	instanceDir := filepath.Join(c.DataDir, "keystore")
 	if err := os.MkdirAll(instanceDir, 0700); err != nil {
-		log.Error(fmt.Sprintf("Failed to persist node key: %v", err))
-		return nil
+		return nil, errors.Wrap(err, "failed to persist node key")
 	}
 
 	keyfile := filepath.Join(instanceDir, datadirPrivateKey)
-	if key, err := crypto.LoadECDSA(keyfile); err == nil {
-		return key
+
+	if _, err := os.Stat(keyfile); os.IsNotExist(err) {
+		// No persistent key found, generate and store a new one.
+		key, err := crypto.GenerateKey()
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to generate node key")
+		}
+		if err := crypto.SaveECDSA(keyfile, key); err != nil {
+			return nil, errors.Wrap(err, "failed to persist node key")
+		}
+		return key, nil
+	} else if err != nil {
+		return nil, errors.Wrap(err, "failed to check node key file")
 	}
-	// No persistent key found, generate and store a new one.
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		log.Crit(fmt.Sprintf("Failed to generate node key: %v", err))
-	}
-	if err := crypto.SaveECDSA(keyfile, key); err != nil {
-		log.Error(fmt.Sprintf("Failed to persist node key: %v", err))
-	}
-	return key
+
+	key, err := crypto.LoadECDSA(keyfile)
+	return key, errors.Wrap(err, "failed to load node key")
 }
 
 // NodeDB returns the path to the discovery node database.
@@ -172,12 +173,15 @@ func MakeMobileConfig(path string, cfg string) (*Config, error) {
 	return conf, nil
 }
 
-func MakeConfig(ctx *cli.Context) (*Config, error) {
+func MakeConfig(ctx *cli.Context, cfgTransform func(cfg *Config)) (*Config, error) {
 	cfg, err := MakeConfigFromFile(ctx.String(CfgFileFlag.Name))
 	if err != nil {
 		return nil, err
 	}
-
+	if ctx.IsSet(DataDirFlag.Name) {
+		cfg.DataDir = ctx.String(DataDirFlag.Name)
+	}
+	cfgTransform(cfg)
 	applyFlags(ctx, cfg)
 	return cfg, nil
 }
@@ -235,7 +239,7 @@ func getDefaultConfig(dataDir string) *Config {
 		P2P: P2P{
 			MaxInboundPeers:  DefaultMaxInboundPeers,
 			MaxOutboundPeers: DefaultMaxOutboundPeers,
-			CollectMetrics:   false,
+			DisableMetrics:   false,
 		},
 		Consensus: GetDefaultConsensusConfig(),
 		RPC:       rpc.GetDefaultRPCConfig(DefaultRpcHost, DefaultRpcPort),
@@ -259,9 +263,6 @@ func getDefaultConfig(dataDir string) *Config {
 }
 
 func applyFlags(ctx *cli.Context, cfg *Config) {
-	if ctx.IsSet(DataDirFlag.Name) {
-		cfg.DataDir = ctx.String(DataDirFlag.Name)
-	}
 	applyProfile(ctx, cfg)
 	applyP2PFlags(ctx, cfg)
 	applyConsensusFlags(ctx, cfg)
@@ -343,7 +344,7 @@ func loadConfig(configPath string, conf *Config) error {
 		byteValue, _ := ioutil.ReadAll(jsonFile)
 		err := json.Unmarshal(byteValue, &conf)
 		if err != nil {
-			return errors.Errorf("Cannot parse JSON config, path: %v", configPath)
+			return errors.Wrap(err, errors.Errorf("Cannot parse JSON config, path: %v", configPath).Error())
 		}
 		return nil
 	}

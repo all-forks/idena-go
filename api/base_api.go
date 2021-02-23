@@ -33,8 +33,16 @@ func NewBaseApi(engine *consensus.Engine, txpool *mempool.TxPool, ks *keystore.K
 	return &BaseApi{engine, txpool, ks, secStore}
 }
 
-func (api *BaseApi) getAppState() *appstate.AppState {
+func (api *BaseApi) getReadonlyAppState() *appstate.AppState {
 	state, err := api.engine.ReadonlyAppState()
+	if err != nil {
+		panic(err)
+	}
+	return state
+}
+
+func (api *BaseApi) getAppStateForCheck() *appstate.AppState {
+	state, err := api.engine.AppStateForCheck()
 	if err != nil {
 		panic(err)
 	}
@@ -48,14 +56,16 @@ func (api *BaseApi) getCurrentCoinbase() common.Address {
 func (api *BaseApi) getTx(from common.Address, to *common.Address, txType types.TxType, amount decimal.Decimal,
 	maxFee decimal.Decimal, tips decimal.Decimal, nonce uint32, epoch uint16, payload []byte) *types.Transaction {
 
+	state := api.getReadonlyAppState()
+
 	// if maxFee is not set, we set it as 2x from fee
 	if maxFee == (decimal.Decimal{}) || maxFee == decimal.Zero {
-		tx := blockchain.BuildTx(api.getAppState(), from, to, txType, amount, maxFee, tips, nonce, epoch, payload)
-		txFee := fee.CalculateFee(api.getAppState().ValidatorsCache.NetworkSize(), api.getAppState().State.FeePerByte(), tx)
+		tx := blockchain.BuildTx(state, from, to, txType, amount, maxFee, tips, nonce, epoch, payload)
+		txFee := fee.CalculateFee(state.ValidatorsCache.NetworkSize(), state.State.FeePerGas(), tx)
 		maxFee = blockchain.ConvertToFloat(new(big.Int).Mul(txFee, big.NewInt(2)))
 	}
 
-	tx := blockchain.BuildTx(api.getAppState(), from, to, txType, amount, maxFee, tips, nonce, epoch, payload)
+	tx := blockchain.BuildTx(state, from, to, txType, amount, maxFee, tips, nonce, epoch, payload)
 
 	return tx
 }

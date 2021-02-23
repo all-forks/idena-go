@@ -7,13 +7,17 @@ import (
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/eventbus"
+	"github.com/idena-network/idena-go/config"
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/core/state/snapshot"
+	"github.com/idena-network/idena-go/core/upgrade"
 	"github.com/idena-network/idena-go/core/validators"
 	"github.com/idena-network/idena-go/events"
 	"github.com/idena-network/idena-go/ipfs"
+	"github.com/idena-network/idena-go/keystore"
 	"github.com/idena-network/idena-go/log"
+	"github.com/idena-network/idena-go/subscriptions"
 	"github.com/pkg/errors"
 	"os"
 	"time"
@@ -37,6 +41,10 @@ type fastSync struct {
 	bus                  eventbus.Bus
 	deferredHeaders      []blockPeer
 	coinBase             common.Address
+	keyStore             *keystore.KeyStore
+	subManager           *subscriptions.Manager
+	upgrader             *upgrade.Upgrader
+	prevConfig           *config.ConsensusConf
 }
 
 func (fs *fastSync) batchSize() uint64 {
@@ -48,7 +56,8 @@ func NewFastSync(pm *IdenaGossipHandler, log log.Logger,
 	ipfs ipfs.Proxy,
 	appState *appstate.AppState,
 	potentialForkedPeers mapset.Set,
-	manifest *snapshot.Manifest, sm *state.SnapshotManager, bus eventbus.Bus, coinbase common.Address) *fastSync {
+	manifest *snapshot.Manifest, sm *state.SnapshotManager, bus eventbus.Bus, coinbase common.Address, keyStore *keystore.KeyStore,
+	subManager *subscriptions.Manager, upgrader *upgrade.Upgrader) *fastSync {
 
 	return &fastSync{
 		appState:             appState,
@@ -63,6 +72,9 @@ func NewFastSync(pm *IdenaGossipHandler, log log.Logger,
 		sm:                   sm,
 		bus:                  bus,
 		coinBase:             coinbase,
+		keyStore:             keyStore,
+		subManager:           subManager,
+		upgrader:             upgrader,
 	}
 }
 
@@ -72,6 +84,12 @@ func (fs *fastSync) createPreliminaryCopy(height uint64) (*state.IdentityStateDB
 
 func (fs *fastSync) dropPreliminaries() {
 	fs.chain.RemovePreliminaryHead(nil)
+	fs.chain.RemovePreliminaryConsensusVersion()
+	fs.chain.RemovePreliminaryIntermediateGenesis()
+	if fs.prevConfig != nil {
+		fs.upgrader.RevertConfig(fs.prevConfig)
+		fs.prevConfig = nil
+	}
 	fs.appState.IdentityState.DropPreliminary()
 	fs.stateDb = nil
 }
@@ -79,6 +97,15 @@ func (fs *fastSync) dropPreliminaries() {
 func (fs *fastSync) loadValidators() {
 	fs.validators = validators.NewValidatorsCache(fs.stateDb, fs.appState.State.GodAddress())
 	fs.validators.Load()
+}
+
+func (fs *fastSync) tryUpgradeConsensus(header *types.Header) {
+	if header.ProposedHeader != nil && header.ProposedHeader.Upgrade == uint32(fs.upgrader.Target()) {
+		fs.log.Info("Detect upgrade block while fast syncing", "upgrade", fs.upgrader.Target())
+		fs.prevConfig = fs.upgrader.UpgradeConfigTo(header.ProposedHeader.Upgrade)
+		fs.chain.WritePreliminaryConsensusVersion(header.ProposedHeader.Upgrade)
+		fs.upgrader.MigrateIdentityStateDb()
+	}
 }
 
 func (fs *fastSync) preConsuming(head *types.Header) (from uint64, err error) {
@@ -92,11 +119,16 @@ func (fs *fastSync) preConsuming(head *types.Header) (from uint64, err error) {
 		fs.loadValidators()
 		return from, err
 	}
+	if ver := fs.chain.ReadPreliminaryConsensusVersion(); ver > 0 {
+		fs.prevConfig = fs.upgrader.UpgradeConfigTo(ver)
+	}
+	fs.tryUpgradeConsensus(fs.chain.PreliminaryHead)
 	fs.stateDb, err = fs.appState.IdentityState.LoadPreliminary(fs.chain.PreliminaryHead.Height())
 	if err != nil {
 		fs.dropPreliminaries()
 		return fs.preConsuming(head)
 	}
+
 	fs.loadValidators()
 	from = fs.chain.PreliminaryHead.Height() + 1
 	return from, nil
@@ -121,6 +153,11 @@ func (fs *fastSync) applyDeferredBlocks() (uint64, error) {
 			fs.pm.BanPeer(b.peerId, err)
 			return b.Header.Height(), err
 		}
+		fs.tryUpgradeConsensus(b.Header)
+
+		if b.Header.Flags().HasFlag(types.NewGenesis) {
+			fs.chain.WritePreliminaryIntermediateGenesis(b.Header.Height())
+		}
 
 		if !b.IdentityDiff.Empty() {
 			fs.loadValidators()
@@ -136,16 +173,39 @@ func (fs *fastSync) applyDeferredBlocks() (uint64, error) {
 		if err != nil {
 			return b.Header.Height(), err
 		}
-		if bloom.Has(fs.coinBase) {
+		if fs.testBloom(bloom) {
 			txs, err := fs.GetBlockTransactions(b.Header.Hash(), b.Header.ProposedHeader.IpfsHash)
 			if err != nil {
 				return b.Header.Height(), err
 			}
 			fs.chain.WriteTxIndex(b.Header.Hash(), txs)
 			fs.chain.Indexer().HandleBlockTransactions(b.Header, txs)
+
+			receipts, err := fs.GetTxReceipts(b.Header.ProposedHeader.TxReceiptsCid)
+			if err != nil {
+				return b.Header.Height(), err
+			}
+			fs.chain.WriteTxReceipts(b.Header.ProposedHeader.TxReceiptsCid, receipts)
 		}
 	}
 	return 0, nil
+}
+
+func (fs *fastSync) testBloom(bloom *common.SerializableBF) bool {
+	if bloom.Has(fs.coinBase.Bytes()) {
+		return true
+	}
+	for _, a := range fs.keyStore.Accounts() {
+		if bloom.Has(a.Address.Bytes()) {
+			return true
+		}
+	}
+	for _, s := range fs.subManager.RawSubscriptions() {
+		if bloom.Has(s) {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *fastSync) GetBlockTransactions(hash common.Hash, ipfsHash []byte) (types.Transactions, error) {
@@ -158,6 +218,18 @@ func (fs *fastSync) GetBlockTransactions(hash common.Hash, ipfsHash []byte) (typ
 		body := &types.Body{}
 		body.FromBytes(txs)
 		return body.Transactions, nil
+	}
+}
+
+func (fs *fastSync) GetTxReceipts(receiptCid []byte) (types.TxReceipts, error) {
+	if data, err := fs.ipfs.Get(receiptCid, ipfs.TxReceipt); err != nil {
+		return nil, err
+	} else {
+		if len(data) == 0 {
+			return nil, nil
+		}
+		body := types.TxReceipts{}
+		return body.FromBytes(data), nil
 	}
 }
 
@@ -237,7 +309,8 @@ func (fs *fastSync) validateHeader(block *block) error {
 		return err
 	}
 
-	if block.Header.Flags().HasFlag(types.IdentityUpdate) {
+	if block.Header.Flags().HasFlag(types.IdentityUpdate|types.Snapshot|types.NewGenesis) ||
+		block.Header.ProposedHeader != nil && block.Header.ProposedHeader.Upgrade > 0 {
 		if block.Cert.Empty() {
 			return BlockCertIsMissing
 		}
@@ -270,7 +343,7 @@ func (fs *fastSync) postConsuming() error {
 	if err != nil {
 		return err
 	}
-	err = fs.appState.State.RecoverSnapshot(fs.manifest, file)
+	err = fs.appState.State.RecoverSnapshot(fs.manifest.Height, fs.manifest.Root, file)
 	file.Close()
 	if err != nil {
 		fs.sm.AddInvalidManifest(fs.manifest.Cid)

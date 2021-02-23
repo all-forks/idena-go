@@ -14,6 +14,8 @@ var (
 
 	transactionIndexPrefix = []byte("ti")
 
+	receiptIndexPrefix = []byte("ri")
+
 	ownTransactionIndexPrefix = []byte("oti")
 
 	burntCoinsPrefix = []byte("bc")
@@ -31,4 +33,16 @@ var (
 	preliminaryHeadKey = []byte("preliminary-head")
 
 	activityMonitorKey = []byte("activity")
+
+	eventPrefix = []byte("e")
+
+	intermediateGenesisKey = []byte("g")
+
+	preliminaryIntermediateGenesisKey = []byte("pg")
+
+	upgradeVotesKey = []byte("uv")
+
+	consensusVersionKey = []byte("v")
+
+	preliminaryConsVersionKey = []byte("pv")
 )

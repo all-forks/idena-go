@@ -9,13 +9,14 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/core/mempool"
 	"github.com/idena-network/idena-go/core/state"
+	"github.com/idena-network/idena-go/core/upgrade"
 	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/keystore"
 	"github.com/idena-network/idena-go/secstore"
 	"github.com/idena-network/idena-go/stats/collector"
+	"github.com/idena-network/idena-go/subscriptions"
 	"github.com/tendermint/tm-db"
-	"math/big"
 )
 
 func NewTestBlockchainWithConfig(withIdentity bool, conf *config.ConsensusConf, valConf *config.ValidationConfig, alloc map[common.Address]config.GenesisAllocation, queueSlots int, executableSlots int, executableLimit int, queueLimit int) (*TestBlockchain, *appstate.AppState, *mempool.TxPool, *ecdsa.PrivateKey) {
@@ -46,7 +47,7 @@ func NewTestBlockchainWithConfig(withIdentity bool, conf *config.ConsensusConf, 
 
 	db := db.NewMemDB()
 	bus := eventbus.New()
-	appState := appstate.NewAppState(db, bus)
+	appState, _ := appstate.NewAppState(db, bus)
 
 	if withIdentity {
 		addr := crypto.PubkeyToAddress(key.PublicKey)
@@ -55,11 +56,12 @@ func NewTestBlockchainWithConfig(withIdentity bool, conf *config.ConsensusConf, 
 		}
 	}
 
-	txPool := mempool.NewTxPool(appState, bus, cfg.Mempool)
+	txPool := mempool.NewTxPool(appState, bus, cfg.Mempool, collector.NewStatsCollector())
 	offline := NewOfflineDetector(cfg, db, appState, secStore, bus)
 	keyStore := keystore.NewKeyStore("./testdata", keystore.StandardScryptN, keystore.StandardScryptP)
-
-	chain := NewBlockchain(cfg, db, txPool, appState, ipfs.NewMemoryIpfsProxy(), secStore, bus, offline, keyStore)
+	subManager, _ := subscriptions.NewManager("./testdata2")
+	upgrader := upgrade.NewUpgrader(cfg, appState, db)
+	chain := NewBlockchain(cfg, db, txPool, appState, ipfs.NewMemoryIpfsProxy(), secStore, bus, offline, keyStore, subManager, upgrader)
 
 	chain.InitializeChain()
 	appState.Initialize(chain.Head.Height())
@@ -100,17 +102,18 @@ func NewCustomTestBlockchain(blocksCount int, emptyBlocksCount int, key *ecdsa.P
 func NewCustomTestBlockchainWithConfig(blocksCount int, emptyBlocksCount int, key *ecdsa.PrivateKey, cfg *config.Config) (*TestBlockchain, *appstate.AppState) {
 	db := db.NewMemDB()
 	bus := eventbus.New()
-	appState := appstate.NewAppState(db, bus)
+	appState, _ := appstate.NewAppState(db, bus)
 	secStore := secstore.NewSecStore()
 	secStore.AddKey(crypto.FromECDSA(key))
 	if cfg.OfflineDetection == nil {
 		cfg.OfflineDetection = config.GetDefaultOfflineDetectionConfig()
 	}
-	txPool := mempool.NewTxPool(appState, bus, config.GetDefaultMempoolConfig())
+	txPool := mempool.NewTxPool(appState, bus, config.GetDefaultMempoolConfig(), collector.NewStatsCollector())
 	offline := NewOfflineDetector(cfg, db, appState, secStore, bus)
 	keyStore := keystore.NewKeyStore("./testdata", keystore.StandardScryptN, keystore.StandardScryptP)
-
-	chain := NewBlockchain(cfg, db, txPool, appState, ipfs.NewMemoryIpfsProxy(), secStore, bus, offline, keyStore)
+	subManager, _ := subscriptions.NewManager("./testdata2")
+	upgrader := upgrade.NewUpgrader(cfg, appState, db)
+	chain := NewBlockchain(cfg, db, txPool, appState, ipfs.NewMemoryIpfsProxy(), secStore, bus, offline, keyStore, subManager, upgrader)
 	chain.InitializeChain()
 	appState.Initialize(chain.Head.Height())
 
@@ -134,7 +137,7 @@ func (chain *TestBlockchain) Copy() (*TestBlockchain, *appstate.AppState) {
 	for ; it.Valid(); it.Next() {
 		db.Set(it.Key(), it.Value())
 	}
-	appState := appstate.NewAppState(db, bus)
+	appState, _ := appstate.NewAppState(db, bus)
 	consensusCfg := config.GetDefaultConsensusConfig()
 	consensusCfg.Automine = true
 	cfg := &config.Config{
@@ -149,11 +152,12 @@ func (chain *TestBlockchain) Copy() (*TestBlockchain, *appstate.AppState) {
 		Blockchain:       &config.BlockchainConfig{},
 		OfflineDetection: config.GetDefaultOfflineDetectionConfig(),
 	}
-	txPool := mempool.NewTxPool(appState, bus, config.GetDefaultMempoolConfig())
+	txPool := mempool.NewTxPool(appState, bus, config.GetDefaultMempoolConfig(), collector.NewStatsCollector())
 	offline := NewOfflineDetector(cfg, db, appState, chain.secStore, bus)
 	keyStore := keystore.NewKeyStore("./testdata", keystore.StandardScryptN, keystore.StandardScryptP)
-
-	copy := NewBlockchain(cfg, db, txPool, appState, ipfs.NewMemoryIpfsProxy(), chain.secStore, bus, offline, keyStore)
+	subManager, _ := subscriptions.NewManager("./testdata2")
+	upgrader := upgrade.NewUpgrader(cfg, appState, db)
+	copy := NewBlockchain(cfg, db, txPool, appState, ipfs.NewMemoryIpfsProxy(), chain.secStore, bus, offline, keyStore, subManager, upgrader)
 	copy.InitializeChain()
 	appState.Initialize(copy.Head.Height())
 	return &TestBlockchain{db, copy}, appState
@@ -169,15 +173,16 @@ func (chain *TestBlockchain) addCert(block *types.Block) {
 			TurnOffline: false,
 		},
 	}
-	vote.Signature = chain.secStore.Sign(vote.Header.SignatureHash().Bytes())
+	hash := crypto.SignatureHash(vote)
+	vote.Signature = chain.secStore.Sign(hash[:])
 	cert := types.FullBlockCert{Votes: []*types.Vote{vote}}
 	chain.WriteCertificate(block.Header.Hash(), cert.Compress(), true)
 }
 
 func (chain *TestBlockchain) GenerateBlocks(count int) *TestBlockchain {
 	for i := 0; i < count; i++ {
-		block := chain.ProposeBlock()
-		block.Block.Header.ProposedHeader.Time = big.NewInt(0).Add(chain.Head.Time(), big.NewInt(20))
+		block := chain.ProposeBlock([]byte{})
+		block.Block.Header.ProposedHeader.Time = chain.Head.Time() + 20
 		err := chain.AddBlock(block.Block, nil, collector.NewStatsCollector())
 		if err != nil {
 			panic(err)

@@ -1,4 +1,4 @@
-package entry
+package pushpull
 
 import (
 	"github.com/idena-network/idena-go/common"
@@ -53,7 +53,7 @@ func TestSortedPendingRequests_MoveWithNewTime(t *testing.T) {
 }
 
 func toInt64Array(list *sortedPendingPushes) []int64 {
-	times := []int64{}
+	var times []int64
 	for _, r := range list.list {
 		times = append(times, r.time.Unix())
 	}
@@ -103,14 +103,21 @@ func TestDefaultPushTracker_AddPendingRequest(t *testing.T) {
 	tracker.AddPendingPush("6", hash1)
 
 	time.Sleep(time.Millisecond * 700)
-	holder.Add(hash1, 1)
+	holder.Add(hash1, 1, false)
 	wg.Wait()
 
 	require.Equal(t, peer.ID("3"), pulls[0].Id)
 	require.Equal(t, peer.ID("4"), pulls[1].Id)
 	require.Equal(t, peer.ID(""), pulls[2].Id)
 	require.Len(t, tracker.Requests(), 0)
-	require.Len(t, tracker.activePulls, 0)
+
+	len := 0
+	tracker.activePulls.Range(func(key, value interface{}) bool {
+		len++
+		return true
+	})
+
+	require.Equal(t, 0, len)
 
 	require.Len(t, tracker.pendingPushes.list, 0)
 

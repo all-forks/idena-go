@@ -16,7 +16,6 @@ import (
 	"github.com/idena-network/idena-go/core/profile"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/crypto"
-	"github.com/idena-network/idena-go/rlp"
 	"github.com/ipfs/go-cid"
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
@@ -57,7 +56,7 @@ type Balance struct {
 }
 
 func (api *DnaApi) GetBalance(address common.Address) Balance {
-	state := api.baseApi.getAppState()
+	state := api.baseApi.getReadonlyAppState()
 	currentEpoch := state.State.Epoch()
 	nonce, epoch := state.State.GetNonce(address), state.State.GetEpoch(address)
 	if epoch < currentEpoch {
@@ -71,15 +70,16 @@ func (api *DnaApi) GetBalance(address common.Address) Balance {
 	}
 }
 
-// SendTxArgs represents the arguments to sumbit a new transaction into the transaction pool.
+// SendTxArgs represents the arguments to submit a new transaction into the transaction pool.
 type SendTxArgs struct {
-	Type    types.TxType    `json:"type"`
-	From    common.Address  `json:"from"`
-	To      *common.Address `json:"to"`
-	Amount  decimal.Decimal `json:"amount"`
-	MaxFee  decimal.Decimal `json:"maxFee"`
-	Payload *hexutil.Bytes  `json:"payload"`
-	Tips    decimal.Decimal `json:"tips"`
+	Type     types.TxType    `json:"type"`
+	From     common.Address  `json:"from"`
+	To       *common.Address `json:"to"`
+	Amount   decimal.Decimal `json:"amount"`
+	MaxFee   decimal.Decimal `json:"maxFee"`
+	Payload  *hexutil.Bytes  `json:"payload"`
+	Tips     decimal.Decimal `json:"tips"`
+	UseProto bool            `json:"useProto"`
 	BaseTxArgs
 }
 
@@ -91,8 +91,8 @@ type SendInviteArgs struct {
 }
 
 type ActivateInviteArgs struct {
-	Key string          `json:"key"`
-	To  *common.Address `json:"to"`
+	Key    string         `json:"key"`
+	PubKey *hexutil.Bytes `json:"pubKey"`
 	BaseTxArgs
 }
 
@@ -144,13 +144,18 @@ func (api *DnaApi) ActivateInvite(ctx context.Context, args ActivateInviteArgs) 
 		}
 		from = crypto.PubkeyToAddress(key.PublicKey)
 	}
-	payload := api.baseApi.secStore.GetPubKey()
-	to := args.To
-	if to == nil {
-		coinbase := api.baseApi.getCurrentCoinbase()
-		to = &coinbase
+
+	var pubKey []byte
+	if args.PubKey != nil {
+		pubKey = *args.PubKey
+	} else {
+		pubKey = api.baseApi.secStore.GetPubKey()
 	}
-	hash, err := api.baseApi.sendTx(ctx, from, to, types.ActivationTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, payload, key)
+	to, err := crypto.PubKeyBytesToAddress(pubKey)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	hash, err := api.baseApi.sendTx(ctx, from, &to, types.ActivationTx, decimal.Zero, decimal.Zero, decimal.Zero, args.Nonce, args.Epoch, pubKey, key)
 
 	if err != nil {
 		return common.Hash{}, err
@@ -188,6 +193,11 @@ func (api *DnaApi) SendTransaction(ctx context.Context, args SendTxArgs) (common
 		payload = *args.Payload
 	}
 
+	//TODO: remove after UI update
+	if args.Type == types.KillTx {
+		args.To = nil
+	}
+
 	return api.baseApi.sendTx(ctx, args.From, args.To, args.Type, args.Amount, args.MaxFee, args.Tips, args.Nonce, args.Epoch, payload, nil)
 }
 
@@ -222,8 +232,8 @@ type Identity struct {
 
 func (api *DnaApi) Identities() []Identity {
 	var identities []Identity
-	epoch := api.baseApi.getAppState().State.Epoch()
-	api.baseApi.getAppState().State.IterateIdentities(func(key []byte, value []byte) bool {
+	epoch := api.baseApi.getReadonlyAppState().State.Epoch()
+	api.baseApi.getReadonlyAppState().State.IterateIdentities(func(key []byte, value []byte) bool {
 		if key == nil {
 			return true
 		}
@@ -231,7 +241,7 @@ func (api *DnaApi) Identities() []Identity {
 		addr.SetBytes(key[1:])
 
 		var data state.Identity
-		if err := rlp.DecodeBytes(value, &data); err != nil {
+		if err := data.FromBytes(value); err != nil {
 			return false
 		}
 		var flipKeyWordPairs []int
@@ -244,7 +254,7 @@ func (api *DnaApi) Identities() []Identity {
 	})
 
 	for idx := range identities {
-		identities[idx].Online = getIdentityOnlineStatus(api.baseApi.getAppState(), identities[idx].Address)
+		identities[idx].Online = getIdentityOnlineStatus(api.baseApi.getReadonlyAppState(), identities[idx].Address)
 	}
 
 	return identities
@@ -258,8 +268,8 @@ func (api *DnaApi) Identity(address *common.Address) Identity {
 		flipKeyWordPairs = api.ceremony.FlipKeyWordPairs()
 	}
 
-	converted := convertIdentity(api.baseApi.getAppState().State.Epoch(), *address, api.baseApi.getAppState().State.GetIdentity(*address), flipKeyWordPairs)
-	converted.Online = getIdentityOnlineStatus(api.baseApi.getAppState(), *address)
+	converted := convertIdentity(api.baseApi.getReadonlyAppState().State.Epoch(), *address, api.baseApi.getReadonlyAppState().State.GetIdentity(*address), flipKeyWordPairs)
+	converted.Online = getIdentityOnlineStatus(api.baseApi.getReadonlyAppState(), *address)
 	return converted
 }
 
@@ -341,6 +351,8 @@ func convertIdentity(currentEpoch uint16, address common.Address, data state.Ide
 		age = currentEpoch - data.Birthday
 	}
 
+	totalPoints, totalFlips := common.CalculateIdentityScores(data.Scores, data.GetShortFlipPoints(), data.QualifiedFlips)
+
 	return Identity{
 		Address:             address,
 		State:               s,
@@ -353,8 +365,8 @@ func convertIdentity(currentEpoch uint16, address common.Address, data state.Ide
 		AvailableFlips:      data.GetMaximumAvailableFlips(),
 		FlipKeyWordPairs:    convertedFlipKeyWordPairs,
 		MadeFlips:           uint8(len(data.Flips)),
-		QualifiedFlips:      data.QualifiedFlips,
-		ShortFlipPoints:     data.GetShortFlipPoints(),
+		QualifiedFlips:      totalFlips,
+		ShortFlipPoints:     totalPoints,
 		Flips:               result,
 		Generation:          data.Generation,
 		Code:                data.Code,
@@ -372,7 +384,7 @@ type Epoch struct {
 }
 
 func (api *DnaApi) Epoch() Epoch {
-	s := api.baseApi.getAppState()
+	s := api.baseApi.getReadonlyAppState()
 	var res string
 	switch s.State.ValidationPeriod() {
 	case state.NonePeriod:
@@ -399,21 +411,19 @@ func (api *DnaApi) Epoch() Epoch {
 }
 
 type CeremonyIntervals struct {
-	FlipLotteryDuration      float64
-	ShortSessionDuration     float64
-	LongSessionDuration      float64
-	AfterLongSessionDuration float64
+	FlipLotteryDuration  float64
+	ShortSessionDuration float64
+	LongSessionDuration  float64
 }
 
 func (api *DnaApi) CeremonyIntervals() CeremonyIntervals {
 	cfg := api.bc.Config()
-	networkSize := api.baseApi.getAppState().ValidatorsCache.NetworkSize()
+	networkSize := api.baseApi.getReadonlyAppState().ValidatorsCache.NetworkSize()
 
 	return CeremonyIntervals{
-		FlipLotteryDuration:      cfg.Validation.GetFlipLotteryDuration().Seconds(),
-		ShortSessionDuration:     cfg.Validation.GetShortSessionDuration().Seconds(),
-		LongSessionDuration:      cfg.Validation.GetLongSessionDuration(networkSize).Seconds(),
-		AfterLongSessionDuration: cfg.Validation.GetAfterLongSessionDuration().Seconds(),
+		FlipLotteryDuration:  cfg.Validation.GetFlipLotteryDuration().Seconds(),
+		ShortSessionDuration: cfg.Validation.GetShortSessionDuration().Seconds(),
+		LongSessionDuration:  cfg.Validation.GetLongSessionDuration(networkSize).Seconds(),
 	}
 }
 
@@ -509,7 +519,7 @@ func (api *DnaApi) Profile(address *common.Address) (ProfileResponse, error) {
 		coinbase := api.GetCoinbaseAddr()
 		address = &coinbase
 	}
-	identity := api.baseApi.getAppState().State.GetIdentity(*address)
+	identity := api.baseApi.getReadonlyAppState().State.GetIdentity(*address)
 	if len(identity.ProfileHash) == 0 {
 		return ProfileResponse{}, nil
 	}
@@ -552,7 +562,8 @@ func (api *DnaApi) SignatureAddress(args SignatureAddressArgs) (common.Address, 
 }
 
 func signatureHash(value string) common.Hash {
-	return rlp.Hash(value)
+	h := crypto.Hash([]byte(value))
+	return crypto.Hash(h[:])
 }
 
 type ActivateInviteToRandAddrArgs struct {
@@ -588,4 +599,13 @@ func (api *DnaApi) ActivateInviteToRandAddr(ctx context.Context, args ActivateIn
 		Address: to,
 		Key:     hex.EncodeToString(crypto.FromECDSA(toKey)),
 	}, nil
+}
+
+func (api *DnaApi) IsValidationReady() bool {
+	return api.ceremony.IsValidationReady()
+}
+
+func (api *DnaApi) WordsSeed() hexutil.Bytes {
+	seed := api.baseApi.getReadonlyAppState().State.FlipWordsSeed()
+	return seed[:]
 }

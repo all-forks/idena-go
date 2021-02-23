@@ -5,6 +5,7 @@ import (
 	"github.com/idena-network/idena-go/common/eventbus"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/core/validators"
+	models "github.com/idena-network/idena-go/protobuf"
 	"github.com/pkg/errors"
 	dbm "github.com/tendermint/tm-db"
 )
@@ -18,15 +19,21 @@ type AppState struct {
 	defaultTree     bool
 }
 
-func NewAppState(db dbm.DB, bus eventbus.Bus) *AppState {
-	stateDb := state.NewLazy(db)
-	identityStateDb := state.NewLazyIdentityState(db)
+func NewAppState(db dbm.DB, bus eventbus.Bus) (*AppState, error) {
+	stateDb, err := state.NewLazy(db)
+	if err != nil {
+		return nil, err
+	}
+	identityStateDb, err := state.NewLazyIdentityState(db)
+	if err != nil {
+		return nil, err
+	}
 	return &AppState{
 		State:         stateDb,
 		IdentityState: identityStateDb,
 		EvidenceMap:   NewEvidenceMap(bus),
 		defaultTree:   true,
-	}
+	}, nil
 }
 func (s *AppState) ForCheck(height uint64) (*AppState, error) {
 	st, err := s.State.ForCheck(height)
@@ -170,46 +177,11 @@ func (s *AppState) ResetTo(height uint64) error {
 	return nil
 }
 
-func (s *AppState) SetPredefinedState(predefinedState *state.PredefinedState) {
+func (s *AppState) SetPredefinedState(predefinedState *models.ProtoPredefinedState) {
 	s.State.SetPredefinedGlobal(predefinedState)
 	s.State.SetPredefinedStatusSwitch(predefinedState)
 	s.State.SetPredefinedAccounts(predefinedState)
 	s.State.SetPredefinedIdentities(predefinedState)
+	s.State.SetPredefinedContractValues(predefinedState)
 	s.IdentityState.SetPredefinedIdentities(predefinedState)
-}
-
-func (s *AppState) UseSyncTree() error {
-	if !s.defaultTree {
-		return nil
-	}
-	if err := s.State.SwitchTree(state.SyncTreeKeepEvery, state.SyncTreeKeepRecent); err != nil {
-		return err
-	}
-	if err := s.IdentityState.SwitchTree(state.SyncTreeKeepEvery, state.SyncTreeKeepRecent); err != nil {
-		return err
-	}
-	s.defaultTree = false
-	return nil
-}
-
-func (s *AppState) UseDefaultTree() error {
-	if s.defaultTree {
-		return nil
-	}
-	if err := s.State.FlushToDisk(); err != nil {
-		return err
-	}
-
-	if err := s.IdentityState.FlushToDisk(); err != nil {
-		return err
-	}
-
-	if err := s.State.SwitchTree(state.DefaultTreeKeepEvery, state.DefaultTreeKeepRecent); err != nil {
-		return err
-	}
-	if err := s.IdentityState.SwitchTree(state.DefaultTreeKeepEvery, state.DefaultTreeKeepRecent); err != nil {
-		return err
-	}
-	s.defaultTree = true
-	return nil
 }

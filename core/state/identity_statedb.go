@@ -2,13 +2,14 @@ package state
 
 import (
 	"fmt"
+	"github.com/golang/protobuf/proto"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/database"
 	"github.com/idena-network/idena-go/log"
-	"github.com/idena-network/idena-go/rlp"
+	models "github.com/idena-network/idena-go/protobuf"
 	"github.com/pkg/errors"
 	dbm "github.com/tendermint/tm-db"
-	"strconv"
+	"io"
 	"sync"
 )
 
@@ -25,9 +26,13 @@ type IdentityStateDB struct {
 	lock sync.Mutex
 }
 
-func NewLazyIdentityState(db dbm.DB) *IdentityStateDB {
-	pdb := dbm.NewPrefixDB(db, loadIdentityPrefix(db, false))
-	tree := NewMutableTreeWithOpts(pdb, dbm.NewMemDB(), DefaultTreeKeepEvery, DefaultTreeKeepRecent)
+func NewLazyIdentityState(db dbm.DB) (*IdentityStateDB, error) {
+	prefix, err := IdentityStateDbKeys.LoadDbPrefix(db, false)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to load db prefix")
+	}
+	pdb := dbm.NewPrefixDB(db, prefix)
+	tree := NewMutableTree(pdb)
 	return &IdentityStateDB{
 		db:                   pdb,
 		original:             db,
@@ -35,12 +40,12 @@ func NewLazyIdentityState(db dbm.DB) *IdentityStateDB {
 		stateIdentities:      make(map[common.Address]*stateApprovedIdentity),
 		stateIdentitiesDirty: make(map[common.Address]struct{}),
 		log:                  log.New(),
-	}
+	}, nil
 }
 
 func (s *IdentityStateDB) ForCheckWithOverwrite(height uint64) (*IdentityStateDB, error) {
 	db := database.NewBackedMemDb(s.db)
-	tree := NewMutableTreeWithOpts(db, database.NewBackedMemDb(s.tree.RecentDb()), s.tree.KeepEvery(), s.tree.KeepRecent())
+	tree := NewMutableTree(db)
 	if _, err := tree.LoadVersionForOverwriting(int64(height)); err != nil {
 		return nil, err
 	}
@@ -57,7 +62,7 @@ func (s *IdentityStateDB) ForCheckWithOverwrite(height uint64) (*IdentityStateDB
 
 func (s *IdentityStateDB) ForCheck(height uint64) (*IdentityStateDB, error) {
 	db := database.NewBackedMemDb(s.db)
-	tree := NewMutableTreeWithOpts(db, database.NewBackedMemDb(s.tree.RecentDb()), s.tree.KeepEvery(), s.tree.KeepRecent())
+	tree := NewMutableTree(db)
 	if _, err := tree.LoadVersion(int64(height)); err != nil {
 		return nil, err
 	}
@@ -73,7 +78,7 @@ func (s *IdentityStateDB) ForCheck(height uint64) (*IdentityStateDB, error) {
 }
 
 func (s *IdentityStateDB) Readonly(height uint64) (*IdentityStateDB, error) {
-	tree := NewMutableTreeWithOpts(s.db, s.tree.RecentDb(), s.tree.KeepEvery(), s.tree.KeepRecent())
+	tree := NewMutableTree(s.db)
 	if _, err := tree.LazyLoad(int64(height)); err != nil {
 		return nil, err
 	}
@@ -89,7 +94,11 @@ func (s *IdentityStateDB) Readonly(height uint64) (*IdentityStateDB, error) {
 }
 
 func (s *IdentityStateDB) LoadPreliminary(height uint64) (*IdentityStateDB, error) {
-	pdb := dbm.NewPrefixDB(s.original, loadIdentityPrefix(s.original, true))
+	prefix, err := IdentityStateDbKeys.LoadDbPrefix(s.original, true)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to load db prefix")
+	}
+	pdb := dbm.NewPrefixDB(s.original, prefix)
 	tree := NewMutableTree(pdb)
 	version, err := tree.Load()
 	if err != nil {
@@ -233,12 +242,12 @@ func (s *IdentityStateDB) getStateIdentity(addr common.Address) (stateObject *st
 	s.lock.Unlock()
 
 	// Load the object from the database.
-	_, enc := s.tree.Get(append(identityPrefix, addr[:]...))
+	_, enc := s.tree.Get(StateDbKeys.IdentityKey(addr))
 	if len(enc) == 0 {
 		return nil
 	}
 	var data ApprovedIdentity
-	if err := rlp.DecodeBytes(enc, &data); err != nil {
+	if err := data.FromBytes(enc); err != nil {
 		s.log.Error("Failed to decode state identity object", "addr", addr, "err", err)
 		return nil
 	}
@@ -267,18 +276,18 @@ func (s *IdentityStateDB) MarkStateIdentityObjectDirty(addr common.Address) {
 // updateStateAccountObject writes the given object to the trie.
 func (s *IdentityStateDB) updateStateIdentityObject(stateObject *stateApprovedIdentity) (encoded []byte) {
 	addr := stateObject.Address()
-	data, err := rlp.EncodeToBytes(stateObject)
+	data, err := stateObject.data.ToBytes()
 	if err != nil {
-		panic(fmt.Errorf("can't encode object at %x: %v", addr[:], err))
+		panic(fmt.Errorf("can't encode approved identity object at %x: %v", addr[:], err))
 	}
 
-	s.tree.Set(append(identityPrefix, addr[:]...), data)
+	s.tree.Set(StateDbKeys.IdentityKey(addr), data)
 	return data
 }
 
 func (s *IdentityStateDB) updateStateIdentityObjectRaw(stateObject *stateApprovedIdentity, value []byte) {
 	addr := stateObject.Address()
-	s.tree.Set(append(identityPrefix, addr[:]...), value)
+	s.tree.Set(StateDbKeys.IdentityKey(addr), value)
 }
 
 // deleteStateAccountObject removes the given object from the state trie.
@@ -286,7 +295,7 @@ func (s *IdentityStateDB) deleteStateIdentityObject(stateObject *stateApprovedId
 	stateObject.deleted = true
 	addr := stateObject.Address()
 
-	s.tree.Remove(append(identityPrefix, addr[:]...))
+	s.tree.Remove(StateDbKeys.IdentityKey(addr))
 }
 
 func (s *IdentityStateDB) Root() common.Hash {
@@ -358,7 +367,10 @@ func (s *IdentityStateDB) SaveForcedVersion(height uint64) error {
 
 func (s *IdentityStateDB) SwitchToPreliminary(height uint64) (batch dbm.Batch, dropDb dbm.DB, err error) {
 
-	prefix := loadIdentityPrefix(s.original, true)
+	prefix, err := IdentityStateDbKeys.LoadDbPrefix(s.original, true)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "failed to load db prefix")
+	}
 	if prefix == nil {
 		return nil, nil, errors.New("preliminary prefix is not found")
 	}
@@ -369,8 +381,8 @@ func (s *IdentityStateDB) SwitchToPreliminary(height uint64) (batch dbm.Batch, d
 	}
 
 	batch = s.original.NewBatch()
-	setIdentityPrefix(batch, prefix, false)
-	setIdentityPrefix(batch, nil, true)
+	IdentityStateDbKeys.SaveDbPrefix(batch, prefix, false)
+	IdentityStateDbKeys.SaveDbPrefix(batch, []byte{}, true)
 	dropDb = s.db
 
 	s.db = pdb
@@ -379,15 +391,19 @@ func (s *IdentityStateDB) SwitchToPreliminary(height uint64) (batch dbm.Batch, d
 }
 
 func (s *IdentityStateDB) DropPreliminary() {
-	pdb := dbm.NewPrefixDB(s.original, loadIdentityPrefix(s.original, true))
-	common.ClearDb(pdb)
+	if prefix, err := IdentityStateDbKeys.LoadDbPrefix(s.original, true); err != nil {
+		s.log.Error("failed to load db prefix", "err", err)
+	} else {
+		pdb := dbm.NewPrefixDB(s.original, prefix)
+		common.ClearDb(pdb)
+	}
 	b := s.original.NewBatch()
-	setIdentityPrefix(b, nil, true)
+	IdentityStateDbKeys.SaveDbPrefix(b, []byte{}, true)
 	b.WriteSync()
 }
 
 func (s *IdentityStateDB) CreatePreliminaryCopy(height uint64) (*IdentityStateDB, error) {
-	preliminaryPrefix := identityStatePrefix(height + 1)
+	preliminaryPrefix := IdentityStateDbKeys.buildDbPrefix(height + 1)
 	pdb := dbm.NewPrefixDB(s.original, preliminaryPrefix)
 
 	if err := common.Copy(s.db, pdb); err != nil {
@@ -395,34 +411,42 @@ func (s *IdentityStateDB) CreatePreliminaryCopy(height uint64) (*IdentityStateDB
 	}
 
 	b := s.original.NewBatch()
-	setIdentityPrefix(b, preliminaryPrefix, true)
+	IdentityStateDbKeys.SaveDbPrefix(b, preliminaryPrefix, true)
 	if err := b.WriteSync(); err != nil {
 		return nil, err
 	}
 	return s.LoadPreliminary(height)
 }
 
-func (s *IdentityStateDB) SetPredefinedIdentities(state *PredefinedState) {
+func (s *IdentityStateDB) SetPredefinedIdentities(state *models.ProtoPredefinedState) {
 	for _, identity := range state.ApprovedIdentities {
-		stateObj := s.GetOrNewIdentityObject(identity.Address)
+		stateObj := s.GetOrNewIdentityObject(common.BytesToAddress(identity.Address))
 		stateObj.data.Online = false
 		stateObj.data.Approved = identity.Approved
 		stateObj.touch()
 	}
 }
 
-func (s *IdentityStateDB) FlushToDisk() error {
-	return common.Copy(s.tree.RecentDb(), s.db)
+func (s *IdentityStateDB) RecoverSnapshot(height uint64, treeRoot common.Hash, from io.Reader) error {
+	pdb := dbm.NewPrefixDB(s.original, IdentityStateDbKeys.buildDbPrefix(height))
+	return ReadTreeFrom(pdb, height, treeRoot, from)
 }
 
-func (s *IdentityStateDB) SwitchTree(keepEvery, keepRecent int64) error {
-	version := s.tree.Version()
-	s.tree = NewMutableTreeWithOpts(s.db, s.tree.RecentDb(), keepEvery, keepRecent)
-	if _, err := s.tree.LoadVersion(version); err != nil {
-		return err
+func (s *IdentityStateDB) CommitSnapshot(height uint64) (dropDb dbm.DB) {
+	pdb := dbm.NewPrefixDB(s.original, IdentityStateDbKeys.buildDbPrefix(height))
+	batch := s.original.NewBatch()
+	IdentityStateDbKeys.SaveDbPrefix(batch, IdentityStateDbKeys.buildDbPrefix(height), false)
+	batch.Write()
+	dropDb = s.db
+
+	s.db = pdb
+	tree := NewMutableTree(pdb)
+	if _, err := tree.LoadVersion(int64(height)); err != nil {
+		panic(err)
 	}
+	s.tree = tree
 	s.Clear()
-	return nil
+	return dropDb
 }
 
 type IdentityStateDiffValue struct {
@@ -439,35 +463,38 @@ func (diff *IdentityStateDiff) Empty() bool {
 	return diff == nil || len(diff.Values) == 0
 }
 
-func (diff IdentityStateDiff) Bytes() []byte {
-	enc, _ := rlp.EncodeToBytes(diff)
-	return enc
+func (diff *IdentityStateDiff) ToProto() *models.ProtoIdentityStateDiff {
+	protoDiff := new(models.ProtoIdentityStateDiff)
+	for _, item := range diff.Values {
+		protoDiff.Values = append(protoDiff.Values, &models.ProtoIdentityStateDiff_IdentityStateDiffValue{
+			Address: item.Address[:],
+			Deleted: item.Deleted,
+			Value:   item.Value,
+		})
+	}
+	return protoDiff
 }
 
-func identityStatePrefix(height uint64) []byte {
-	return []byte("aid-" + strconv.FormatUint(height, 16))
+func (diff *IdentityStateDiff) ToBytes() ([]byte, error) {
+	return proto.Marshal(diff.ToProto())
 }
 
-func loadIdentityPrefix(db dbm.DB, preliminary bool) []byte {
-	key := currentIdentityStateDbPrefixKey
-	if preliminary {
-		key = preliminaryIdentityStateDbPrefixKey
+func (diff *IdentityStateDiff) FromProto(protoDiff *models.ProtoIdentityStateDiff) *IdentityStateDiff {
+	for _, item := range protoDiff.Values {
+		diff.Values = append(diff.Values, &IdentityStateDiffValue{
+			Address: common.BytesToAddress(item.Address),
+			Deleted: item.Deleted,
+			Value:   item.Value,
+		})
 	}
-	p, _ := db.Get(key)
-	if p == nil {
-		p = identityStatePrefix(0)
-		b := db.NewBatch()
-		setIdentityPrefix(b, p, preliminary)
-		b.WriteSync()
-		return p
-	}
-	return p
+	return diff
 }
 
-func setIdentityPrefix(batch dbm.Batch, prefix []byte, preliminary bool) {
-	key := currentIdentityStateDbPrefixKey
-	if preliminary {
-		key = preliminaryIdentityStateDbPrefixKey
+func (diff *IdentityStateDiff) FromBytes(data []byte) error {
+	protoDiff := new(models.ProtoIdentityStateDiff)
+	if err := proto.Unmarshal(data, protoDiff); err != nil {
+		return err
 	}
-	batch.Set(key, prefix)
+	diff.FromProto(protoDiff)
+	return nil
 }

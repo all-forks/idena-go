@@ -5,6 +5,7 @@ import (
 	"crypto/ecdsa"
 	"fmt"
 	mapset "github.com/deckarep/golang-set"
+	"github.com/golang/protobuf/proto"
 	"github.com/idena-network/idena-go/blockchain/attachments"
 	"github.com/idena-network/idena-go/blockchain/fee"
 	"github.com/idena-network/idena-go/blockchain/types"
@@ -17,6 +18,7 @@ import (
 	"github.com/idena-network/idena-go/core/mempool"
 	"github.com/idena-network/idena-go/core/state"
 	"github.com/idena-network/idena-go/core/state/snapshot"
+	"github.com/idena-network/idena-go/core/upgrade"
 	"github.com/idena-network/idena-go/core/validators"
 	"github.com/idena-network/idena-go/crypto"
 	"github.com/idena-network/idena-go/crypto/vrf/p256"
@@ -25,9 +27,11 @@ import (
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/keystore"
 	"github.com/idena-network/idena-go/log"
-	"github.com/idena-network/idena-go/rlp"
+	models "github.com/idena-network/idena-go/protobuf"
 	"github.com/idena-network/idena-go/secstore"
 	"github.com/idena-network/idena-go/stats/collector"
+	"github.com/idena-network/idena-go/subscriptions"
+	"github.com/idena-network/idena-go/vm"
 	cid2 "github.com/ipfs/go-cid"
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
@@ -61,7 +65,7 @@ type Blockchain struct {
 	secStore        *secstore.SecStore
 	Head            *types.Header
 	PreliminaryHead *types.Header
-	genesis         *types.Header
+	genesisInfo     *types.GenesisInfo
 	config          *config.Config
 	pubKey          []byte
 	coinBaseAddress common.Address
@@ -74,6 +78,8 @@ type Blockchain struct {
 	ipfs            ipfs.Proxy
 	timing          *timing
 	bus             eventbus.Bus
+	subManager      *subscriptions.Manager
+	upgrader        *upgrade.Upgrader
 	applyNewEpochFn func(height uint64, appState *appstate.AppState, collector collector.StatsCollector) (int, *types.ValidationResults, bool)
 	isSyncing       bool
 }
@@ -89,7 +95,7 @@ func init() {
 }
 
 func NewBlockchain(config *config.Config, db dbm.DB, txpool *mempool.TxPool, appState *appstate.AppState,
-	ipfs ipfs.Proxy, secStore *secstore.SecStore, bus eventbus.Bus, offlineDetector *OfflineDetector, keyStore *keystore.KeyStore) *Blockchain {
+	ipfs ipfs.Proxy, secStore *secstore.SecStore, bus eventbus.Bus, offlineDetector *OfflineDetector, keyStore *keystore.KeyStore, subManager *subscriptions.Manager, upgrader *upgrade.Upgrader) *Blockchain {
 	return &Blockchain{
 		repo:            database.NewRepo(db),
 		config:          config,
@@ -102,6 +108,8 @@ func NewBlockchain(config *config.Config, db dbm.DB, txpool *mempool.TxPool, app
 		secStore:        secStore,
 		offlineDetector: offlineDetector,
 		indexer:         newBlockchainIndexer(db, bus, config, keyStore),
+		subManager:      subManager,
+		upgrader:        upgrader,
 	}
 }
 
@@ -125,7 +133,23 @@ func (chain *Blockchain) Config() *config.Config {
 func (chain *Blockchain) Indexer() *indexer {
 	return chain.indexer
 }
-
+func (chain *Blockchain) tryUpgrade(block *types.Header) {
+	target := chain.upgrader.Target()
+	if target == chain.config.Consensus.Version {
+		return
+	}
+	if block.ProposedHeader != nil && block.ProposedHeader.Upgrade == uint32(chain.upgrader.Target()) {
+		chain.log.Info("Detected upgrade block", "upgrade", block.ProposedHeader.Upgrade)
+		chain.repo.WriteConsensusVersion(nil, block.ProposedHeader.Upgrade)
+		chain.upgrader.CompleteMigration()
+		diff := time.Unix(block.Time(), 0).Add(chain.config.Consensus.MigrationTimeout).Sub(time.Now().UTC())
+		if diff > 0 {
+			// pause block producing to allow weak machines process state migration on time
+			chain.log.Info("Node goes to sleep", "duration", diff.String())
+			time.Sleep(diff)
+		}
+	}
+}
 func (chain *Blockchain) InitializeChain() error {
 
 	chain.coinBaseAddress = chain.secStore.GetAddress()
@@ -133,19 +157,38 @@ func (chain *Blockchain) InitializeChain() error {
 	head := chain.GetHead()
 	if head != nil {
 		chain.setCurrentHead(head)
+		chain.tryUpgrade(head)
+
 		genesisHeight := uint64(1)
 
 		if chain.config.Network == Testnet {
 			predefinedState, err := readPredefinedState()
-			if err != nil {
-				return err
+			if err == nil {
+				genesisHeight = predefinedState.Block
+			} else {
+				bindataGenesis, err := chain.readBindataGenesis()
+				if err == nil {
+					genesisHeight = bindataGenesis.Height()
+				}
 			}
-			genesisHeight = predefinedState.Block
 		}
 
-		if chain.genesis = chain.GetBlockHeaderByHeight(genesisHeight); chain.genesis == nil {
+		predefinedGenesis := chain.GetBlockHeaderByHeight(genesisHeight)
+		if predefinedGenesis == nil {
 			return errors.New("genesis block is not found")
 		}
+
+		intermediateGenesisHeight := chain.repo.ReadIntermediateGenesis()
+		if intermediateGenesisHeight == 0 || intermediateGenesisHeight == predefinedGenesis.Height() {
+			chain.genesisInfo = &types.GenesisInfo{Genesis: predefinedGenesis}
+		} else {
+			genesis := chain.GetBlockHeaderByHeight(intermediateGenesisHeight)
+			if genesis == nil {
+				return errors.New("intermediate genesis block is not found")
+			}
+			chain.genesisInfo = &types.GenesisInfo{Genesis: genesis, OldGenesis: predefinedGenesis}
+		}
+
 	} else {
 		_, err := chain.GenerateGenesis(chain.config.Network)
 		if err != nil {
@@ -168,8 +211,55 @@ func (chain *Blockchain) setHead(height uint64, batch dbm.Batch) {
 	chain.setCurrentHead(chain.GetHead())
 }
 
-func (chain *Blockchain) GenerateGenesis(network types.Network) (*types.Block, error) {
+func (chain *Blockchain) readBindataGenesis() (*types.Header, error) {
+	data, err := Asset("bindata/header.tar")
+	if err != nil {
+		return nil, err
+	}
+	header := &types.Header{}
+	if err = header.FromBytes(data); err != nil {
+		return nil, err
+	}
+	return header, nil
+}
 
+func (chain *Blockchain) loadPredefinedGenesis(network types.Network) (*types.Block, error) {
+
+	if network != Testnet {
+		return nil, errors.New(fmt.Sprintf("predefined genesis for network=%v was not found", network))
+	}
+
+	header, err := chain.readBindataGenesis()
+	if err != nil {
+		return nil, err
+	}
+
+	stateDbData, err := Asset("bindata/statedb.tar")
+	if err != nil {
+		return nil, err
+	}
+
+	if err = chain.appState.State.RecoverSnapshot(header.Height(), header.Root(), bytes.NewReader(stateDbData)); err != nil {
+		return nil, err
+	}
+
+	chain.appState.State.CommitSnapshot(header.Height(), nil)
+
+	identityStateDbData, err := Asset("bindata/identitystatedb.tar")
+	if err != nil {
+		return nil, err
+	}
+
+	if err = chain.appState.IdentityState.RecoverSnapshot(header.Height(), header.IdentityRoot(), bytes.NewReader(identityStateDbData)); err != nil {
+		return nil, err
+	}
+
+	chain.appState.IdentityState.CommitSnapshot(header.Height())
+
+	return &types.Block{Header: header, Body: &types.Body{}}, nil
+}
+
+func (chain *Blockchain) generateGenesis(network types.Network) (*types.Block, error) {
 	for addr, alloc := range chain.config.GenesisConf.Alloc {
 		if alloc.Balance != nil {
 			chain.appState.State.SetBalance(addr, alloc.Balance)
@@ -187,7 +277,7 @@ func (chain *Blockchain) GenerateGenesis(network types.Network) (*types.Block, e
 
 	seed := types.Seed(crypto.Keccak256Hash(append([]byte{0x1, 0x2, 0x3, 0x4, 0x5, 0x6}, common.ToBytes(network)...)))
 	blockNumber := uint64(1)
-	var feePerByte *big.Int
+	var feePerGas *big.Int
 
 	if network == Testnet {
 		predefinedState, err := readPredefinedState()
@@ -196,8 +286,8 @@ func (chain *Blockchain) GenerateGenesis(network types.Network) (*types.Block, e
 		}
 
 		blockNumber = predefinedState.Block
-		seed = predefinedState.Seed
-		feePerByte = predefinedState.Global.FeePerByte
+		seed = types.BytesToSeed(predefinedState.Seed)
+		feePerGas = common.BigIntOrNil(predefinedState.Global.FeePerGas)
 
 		err = chain.appState.CommitAt(blockNumber - 1)
 		if err != nil {
@@ -228,42 +318,53 @@ func (chain *Blockchain) GenerateGenesis(network types.Network) (*types.Block, e
 
 	var emptyHash [32]byte
 
-	block := &types.Block{Header: &types.Header{
+	return &types.Block{Header: &types.Header{
 		ProposedHeader: &types.ProposedHeader{
 			ParentHash:   emptyHash,
-			Time:         big.NewInt(0),
+			Time:         0,
 			Height:       blockNumber,
 			Root:         chain.appState.State.Root(),
 			IdentityRoot: chain.appState.IdentityState.Root(),
 			BlockSeed:    seed,
 			IpfsHash:     ipfs.EmptyCid.Bytes(),
-			FeePerByte:   feePerByte,
+			FeePerGas:    feePerGas,
 		},
-	}, Body: &types.Body{}}
+	}, Body: &types.Body{}}, nil
+}
 
-	if err := chain.insertBlock(block, new(state.IdentityStateDiff)); err != nil {
+func (chain *Blockchain) GenerateGenesis(network types.Network) (*types.Block, error) {
+
+	block, err := chain.loadPredefinedGenesis(network)
+	if err != nil {
+		block, err = chain.generateGenesis(network)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if err := chain.insertBlock(block, new(state.IdentityStateDiff), nil); err != nil {
 		return nil, err
 	}
-	chain.genesis = block.Header
+	chain.genesisInfo = &types.GenesisInfo{Genesis: block.Header}
 	return block, nil
 }
 
 func (chain *Blockchain) generateEmptyBlock(checkState *appstate.AppState, prevBlock *types.Header) *types.Block {
-	prevTimestamp := time.Unix(prevBlock.Time().Int64(), 0)
+	prevTimestamp := time.Unix(prevBlock.Time(), 0)
 
 	block := &types.Block{
 		Header: &types.Header{
 			EmptyBlockHeader: &types.EmptyBlockHeader{
 				ParentHash: prevBlock.Hash(),
 				Height:     prevBlock.Height() + 1,
-				Time:       new(big.Int).SetInt64(prevTimestamp.Add(EmptyBlockTimeIncrement).Unix()),
+				Time:       prevTimestamp.Add(EmptyBlockTimeIncrement).Unix(),
 			},
 		},
 		Body: &types.Body{},
 	}
 
 	block.Header.EmptyBlockHeader.BlockSeed = types.Seed(crypto.Keccak256Hash(getSeedData(prevBlock)))
-	block.Header.EmptyBlockHeader.Flags = chain.calculateFlags(checkState, block)
+	block.Header.EmptyBlockHeader.Flags = chain.calculateFlags(checkState, block, prevBlock)
 
 	chain.applyEmptyBlockOnState(checkState, block, nil)
 
@@ -288,17 +389,22 @@ func (chain *Blockchain) AddBlock(block *types.Block, checkState *appstate.AppSt
 	}
 	statsCollector.EnableCollecting()
 	defer statsCollector.CompleteCollecting()
-	diff, err := chain.processBlock(block, statsCollector)
+	diff, receipts, err := chain.processBlock(block, statsCollector)
 	if err != nil {
 		return err
 	}
-	if err := chain.insertBlock(block, diff); err != nil {
+	if err := chain.insertBlock(block, diff, receipts); err != nil {
 		return err
 	}
 	if !chain.isSyncing {
 		chain.txpool.ResetTo(block)
 	}
-
+	chain.tryUpgrade(block.Header)
+	if block.Header.Flags().HasFlag(types.NewGenesis) {
+		chain.repo.WriteIntermediateGenesis(nil, block.Header.Height())
+		chain.genesisInfo.OldGenesis = chain.genesisInfo.Genesis
+		chain.genesisInfo.Genesis = block.Header
+	}
 	chain.bus.Publish(&events.NewBlockEvent{
 		Block: block,
 	})
@@ -307,30 +413,30 @@ func (chain *Blockchain) AddBlock(block *types.Block, checkState *appstate.AppSt
 }
 
 func (chain *Blockchain) processBlock(block *types.Block,
-	statsCollector collector.StatsCollector) (diff *state.IdentityStateDiff, err error) {
+	statsCollector collector.StatsCollector) (diff *state.IdentityStateDiff, receipts types.TxReceipts, err error) {
 
 	var root, identityRoot common.Hash
 	if block.IsEmpty() {
 		root, identityRoot, diff = chain.applyEmptyBlockOnState(chain.appState, block, statsCollector)
 	} else {
-		if root, identityRoot, diff, err = chain.applyBlockAndTxsOnState(chain.appState, block, chain.Head, statsCollector); err != nil {
+		if root, identityRoot, diff, receipts, err = chain.applyBlockAndTxsOnState(chain.appState, block, chain.Head, statsCollector); err != nil {
 			chain.appState.Reset()
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if root != block.Root() || identityRoot != block.IdentityRoot() {
 		chain.appState.Reset()
-		return nil, errors.Errorf("Process block. Invalid block roots. Expected=%x & %x, actual=%x & %x", root, identityRoot, block.Root(), block.IdentityRoot())
+		return nil, nil, errors.Errorf("Process block. Invalid block roots. Expected=%x & %x, actual=%x & %x", root, identityRoot, block.Root(), block.IdentityRoot())
 	}
 
 	if err := chain.appState.Commit(block); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	chain.log.Trace("Applied block", "root", fmt.Sprintf("0x%x", block.Root()), "height", block.Height())
 
-	return diff, nil
+	return diff, receipts, nil
 }
 
 func (chain *Blockchain) applyBlockAndTxsOnState(
@@ -338,23 +444,24 @@ func (chain *Blockchain) applyBlockAndTxsOnState(
 	block *types.Block,
 	prevBlock *types.Header,
 	statsCollector collector.StatsCollector,
-) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff, err error) {
+) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff, receipts types.TxReceipts, err error) {
 	var totalFee, totalTips *big.Int
-	if totalFee, totalTips, err = chain.processTxs(appState, block, statsCollector); err != nil {
+	var usedGas uint64
+	if totalFee, totalTips, receipts, usedGas, err = chain.processTxs(appState, block, statsCollector); err != nil {
 		return
 	}
 
-	root, identityRoot, diff = chain.applyBlockOnState(appState, block, prevBlock, totalFee, totalTips, statsCollector)
-	return root, identityRoot, diff, nil
+	root, identityRoot, diff = chain.applyBlockOnState(appState, block, prevBlock, totalFee, totalTips, usedGas, statsCollector)
+	return root, identityRoot, diff, receipts, nil
 }
 
-func (chain *Blockchain) applyBlockOnState(appState *appstate.AppState, block *types.Block, prevBlock *types.Header, totalFee, totalTips *big.Int, statsCollector collector.StatsCollector) (root common.Hash, identityRoot common.Hash, diff *state.IdentityStateDiff) {
+func (chain *Blockchain) applyBlockOnState(appState *appstate.AppState, block *types.Block, prevBlock *types.Header, totalFee, totalTips *big.Int, usedGas uint64, statsCollector collector.StatsCollector) (root, identityRoot common.Hash, diff *state.IdentityStateDiff) {
 
 	chain.applyNewEpoch(appState, block, statsCollector)
 	chain.applyBlockRewards(totalFee, totalTips, appState, block, prevBlock, statsCollector)
 	chain.applyStatusSwitch(appState, block)
 	chain.applyGlobalParams(appState, block, statsCollector)
-	chain.applyNextBlockFee(appState, block)
+	chain.applyNextBlockFee(appState, block, usedGas)
 	chain.applyVrfProposerThreshold(appState, block)
 	diff = appState.Precommit()
 
@@ -415,7 +522,7 @@ func (chain *Blockchain) applyBlockRewards(totalFee *big.Int, totalTips *big.Int
 
 func calculatePenalty(balanceAppend *big.Int, stakeAppend *big.Int, currentPenalty *big.Int) (balanceAdd *big.Int, stakeAdd *big.Int, penaltySub *big.Int) {
 
-	if currentPenalty == nil {
+	if common.ZeroOrNil(currentPenalty) {
 		return balanceAppend, stakeAppend, nil
 	}
 
@@ -484,41 +591,61 @@ func calculateNewIdentityStatusFlags(validationResults *types.ValidationResults)
 }
 
 type identityWithInvite struct {
-	state   state.IdentityState
 	address common.Address
 	score   float32
+	state   state.IdentityState
 }
 
 func setInvites(appState *appstate.AppState, identitiesWithInvites []identityWithInvite, totalInvitesCount float32,
 	statsCollector collector.StatsCollector) {
 
-	getInvitesCount := func(s state.IdentityState) uint8 {
-		if s == state.Human {
-			return 2
-		}
-		if s == state.Verified {
-			return 1
-		}
-		return 0
+	if len(identitiesWithInvites) == 0 {
+		return
 	}
 
 	currentInvitesCount := int(totalInvitesCount)
+
 	var index int
 	var identity identityWithInvite
+	// first step, give 1 invite to humans
 	for index, identity = range identitiesWithInvites {
+		if identity.score < common.MinHumanTotalScore {
+			break
+		}
+		if identity.state != state.Human {
+			continue
+		}
+		appState.State.AddInvite(identity.address, 1)
+		currentInvitesCount -= 1
+
 		if currentInvitesCount <= 0 {
 			break
 		}
-		invitesForIdentity := getInvitesCount(identity.state)
-		appState.State.SetInvites(identity.address, invitesForIdentity)
-		currentInvitesCount -= int(invitesForIdentity)
 	}
-	if index == 0 {
+
+	if currentInvitesCount == 0 {
+		lastScore := identitiesWithInvites[index].score
+		for i := index + 1; i < len(identitiesWithInvites) && identitiesWithInvites[i].score == lastScore; i++ {
+			if identitiesWithInvites[i].state == state.Human {
+				appState.State.AddInvite(identitiesWithInvites[i].address, 1)
+			}
+		}
+		collector.SetMinScoreForInvite(statsCollector, lastScore)
 		return
 	}
-	lastScore := identitiesWithInvites[index-1].score
-	for i := index; i < len(identitiesWithInvites) && identitiesWithInvites[i].score == lastScore; i++ {
-		appState.State.SetInvites(identitiesWithInvites[i].address, getInvitesCount(identitiesWithInvites[i].state))
+
+	//  second step, distribute remained invites
+	for index, identity = range identitiesWithInvites {
+		appState.State.AddInvite(identity.address, 1)
+		currentInvitesCount -= 1
+		if currentInvitesCount <= 0 {
+			break
+		}
+	}
+
+	lastScore := identitiesWithInvites[index].score
+	for i := index + 1; i < len(identitiesWithInvites) && identitiesWithInvites[i].score == lastScore; i++ {
+		appState.State.AddInvite(identitiesWithInvites[i].address, 1)
 	}
 	collector.SetMinScoreForInvite(statsCollector, lastScore)
 }
@@ -543,10 +670,11 @@ func setNewIdentitiesAttributes(appState *appstate.AppState, totalInvitesCount f
 			switch identity.State {
 			case state.Verified, state.Human:
 				removeLinkWithInviter(appState.State, addr)
+				totalPoints, totalFlips := common.CalculateIdentityScores(identity.Scores, identity.GetShortFlipPoints(), identity.QualifiedFlips)
 				addIdentityWithInvite(identityWithInvite{
 					address: addr,
+					score:   totalPoints / float32(totalFlips),
 					state:   identity.State,
-					score:   identity.GetTotalScore(),
 				})
 				appState.State.SetRequiredFlips(addr, uint8(flips))
 				appState.IdentityState.Add(addr)
@@ -577,16 +705,18 @@ func setNewIdentitiesAttributes(appState *appstate.AppState, totalInvitesCount f
 		}
 	})
 
-	setInvites(appState, identitiesWithInvites, totalInvitesCount, statsCollector)
+	if !validationFailed {
+		setInvites(appState, identitiesWithInvites, totalInvitesCount, statsCollector)
+	}
 }
 
 func clearDustAccounts(appState *appstate.AppState, networkSize int, statsCollector collector.StatsCollector) {
-	commonTxSize := big.NewInt(100)
-	minFeePerByte := fee.GetFeePerByteForNetwork(networkSize)
-	commonTxCost := new(big.Int).Mul(commonTxSize, minFeePerByte)
+	commonTxSize := big.NewInt(1000)
+	minFeePerGas := fee.GetFeePerGasForNetwork(networkSize)
+	commonTxCost := new(big.Int).Mul(commonTxSize, minFeePerGas)
 
 	appState.State.IterateOverAccounts(func(addr common.Address, account state.Account) {
-		if account.Balance.Cmp(commonTxCost) == -1 {
+		if account.Balance == nil || account.Balance.Cmp(commonTxCost) == -1 {
 			collector.BeginDustClearingBalanceUpdate(statsCollector, addr, appState)
 			appState.State.ClearAccount(addr)
 			collector.CompleteBalanceUpdate(statsCollector, appState)
@@ -619,6 +749,19 @@ func removeLinkWithInvitees(stateDB *state.StateDB, inviterAddr common.Address) 
 func (chain *Blockchain) applyGlobalParams(appState *appstate.AppState, block *types.Block,
 	statsCollector collector.StatsCollector) {
 
+	if appState.State.ValidationPeriod() == state.AfterLongSessionPeriod && !block.IsEmpty() {
+		has := false
+		for _, tx := range block.Body.Transactions {
+			if _, ok := types.CeremonialTxs[tx.Type]; ok {
+				has = true
+				break
+			}
+		}
+		if !has {
+			appState.State.IncBlocksCntWithoutCeremonialTxs()
+		}
+	}
+
 	flags := block.Header.Flags()
 	if flags.HasFlag(types.FlipLotteryStarted) {
 		appState.State.SetValidationPeriod(state.FlipLotteryPeriod)
@@ -637,6 +780,7 @@ func (chain *Blockchain) applyGlobalParams(appState *appstate.AppState, block *t
 	}
 
 	if flags.HasFlag(types.ValidationFinished) {
+		appState.State.ResetBlocksCntWithoutCeremonialTxs()
 		appState.State.SetValidationPeriod(state.NonePeriod)
 	}
 
@@ -714,32 +858,42 @@ func (chain *Blockchain) rewardFinalCommittee(appState *appstate.AppState, block
 }
 
 func (chain *Blockchain) processTxs(appState *appstate.AppState, block *types.Block,
-	statsCollector collector.StatsCollector) (totalFee *big.Int, totalTips *big.Int, err error) {
+	statsCollector collector.StatsCollector) (totalFee *big.Int, totalTips *big.Int, receipts types.TxReceipts, usedGas uint64, err error) {
 	totalFee = new(big.Int)
 	totalTips = new(big.Int)
-	minFeePerByte := fee.GetFeePerByteForNetwork(appState.ValidatorsCache.NetworkSize())
+	minFeePerGas := fee.GetFeePerGasForNetwork(appState.ValidatorsCache.NetworkSize())
+
+	vm := vm.NewVmImpl(appState, block.Header, chain.secStore, statsCollector)
 
 	for i := 0; i < len(block.Body.Transactions); i++ {
 		tx := block.Body.Transactions[i]
-		if err := validation.ValidateTx(appState, tx, minFeePerByte, validation.InBlockTx); err != nil {
-			return nil, nil, err
+		if err := validation.ValidateTx(appState, tx, minFeePerGas, validation.InBlockTx); err != nil {
+			return nil, nil, nil, 0, err
 		}
-		if usedFee, err := chain.ApplyTxOnState(appState, tx, statsCollector); err != nil {
-			return nil, nil, err
+		if usedFee, receipt, err := chain.ApplyTxOnState(appState, vm, tx, statsCollector); err != nil {
+			return nil, nil, nil, 0, err
 		} else {
+			gas := uint64(fee.CalculateGas(tx))
+			if receipt != nil {
+				receipts = append(receipts, receipt)
+				gas += receipt.GasUsed
+			}
+			if usedGas+gas > types.MaxBlockGas {
+				return nil, nil, nil, 0, errors.New("block exceeds gas limit")
+			}
+			usedGas += gas
 			totalFee.Add(totalFee, usedFee)
 			totalTips.Add(totalTips, tx.TipsOrZero())
 		}
 	}
 
-	return totalFee, totalTips, nil
+	return totalFee, totalTips, receipts, usedGas, nil
 }
 
-func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.Transaction,
-	statsCollector collector.StatsCollector) (*big.Int, error) {
+func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, vm vm.VM, tx *types.Transaction, statsCollector collector.StatsCollector) (*big.Int, *types.TxReceipt, error) {
 
-	collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
-	defer collector.CompleteBalanceUpdate(statsCollector, appState)
+	collector.BeginApplyingTx(statsCollector, tx, appState)
+	defer collector.CompleteApplyingTx(statsCollector, appState)
 
 	stateDB := appState.State
 
@@ -749,7 +903,7 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 	senderAccount := stateDB.GetOrNewAccountObject(sender)
 
 	if tx.Epoch != globalState.Epoch() {
-		return nil, errors.New(fmt.Sprintf("invalid tx epoch. Tx=%v expectedEpoch=%v actualEpoch=%v", tx.Hash().Hex(),
+		return nil, nil, errors.New(fmt.Sprintf("invalid tx epoch. Tx=%v expectedEpoch=%v actualEpoch=%v", tx.Hash().Hex(),
 			globalState.Epoch(), tx.Epoch))
 	}
 
@@ -760,28 +914,31 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 	}
 
 	if currentNonce+1 != tx.AccountNonce {
-		return nil, errors.New(fmt.Sprintf("invalid tx nonce. Tx=%v expectedNonce=%v actualNonce=%v", tx.Hash().Hex(),
+		return nil, nil, errors.New(fmt.Sprintf("invalid tx nonce. Tx=%v expectedNonce=%v actualNonce=%v", tx.Hash().Hex(),
 			currentNonce+1, tx.AccountNonce))
 	}
 
-	feePerByte := appState.State.FeePerByte()
-	fee := chain.getTxFee(feePerByte, tx)
-	totalCost := chain.getTxCost(feePerByte, tx)
-
+	feePerGas := appState.State.FeePerGas()
+	fee := chain.getTxFee(feePerGas, tx)
+	totalCost := chain.getTxCost(feePerGas, tx)
+	var receipt *types.TxReceipt
 	switch tx.Type {
 	case types.ActivationTx:
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
+
 		balance := stateDB.GetBalance(sender)
 		generation, code := stateDB.GeneticCode(sender)
-		change := new(big.Int).Sub(balance, totalCost)
+		balanceToTransfer := new(big.Int).Sub(balance, totalCost)
 
-		// zero balance and kill temp identity
-		stateDB.SetBalance(sender, big.NewInt(0))
+		// sub balance, which should be transferred, and kill temp identity
+		stateDB.SubBalance(sender, balanceToTransfer)
 		stateDB.SetState(sender, state.Killed)
 
-		// verify identity and add transfer all available funds from temp account
+		// verify identity and add transferred balance
 		recipient := *tx.To
 		stateDB.SetState(recipient, state.Candidate)
-		stateDB.AddBalance(recipient, change)
+		stateDB.AddBalance(recipient, balanceToTransfer)
 		stateDB.SetPubKey(recipient, tx.Payload)
 		stateDB.SetGeneticCode(recipient, generation, code)
 
@@ -794,24 +951,30 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 			}
 		}
 
-		collector.AddActivationTxBalanceTransfer(statsCollector, tx, change)
+		collector.AddActivationTxBalanceTransfer(statsCollector, tx, balanceToTransfer)
 		if sender != *tx.To {
 			collector.AddInviteBurntCoins(statsCollector, sender, appState.State.GetStakeBalance(sender), tx)
 		}
 	case types.SendTx:
-		stateDB.SubBalance(sender, totalCost)
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
+		stateDB.SubBalance(sender, tx.AmountOrZero())
 		stateDB.AddBalance(*tx.To, tx.AmountOrZero())
 	case types.BurnTx:
-		stateDB.SubBalance(sender, totalCost)
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
+		stateDB.SubBalance(sender, tx.AmountOrZero())
 		collector.AddBurnTxBurntCoins(statsCollector, sender, tx)
 	case types.InviteTx:
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		if sender == stateDB.GodAddress() {
 			stateDB.SubGodAddressInvite()
 		} else {
 			stateDB.SubInvite(sender, 1)
 		}
 
-		stateDB.SubBalance(sender, totalCost)
+		stateDB.SubBalance(sender, tx.AmountOrZero())
 		generation, code := stateDB.GeneticCode(sender)
 
 		stateDB.SetState(*tx.To, state.Invite)
@@ -820,28 +983,26 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 
 		stateDB.SetInviter(*tx.To, sender, tx.Hash())
 	case types.KillTx:
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		removeLinksWithInviterAndInvitees(stateDB, sender)
 		stateDB.SetState(sender, state.Killed)
 		appState.IdentityState.Remove(sender)
-		amount := tx.AmountOrZero()
-		stateDB.SubBalance(sender, amount)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
 		stake := stateDB.GetStakeBalance(sender)
 		stateDB.SubStake(sender, stake)
-		stakeToTransfer := new(big.Int).Sub(stake, fee)
-		stateDB.AddBalance(*tx.To, stakeToTransfer)
-		stateDB.AddBalance(*tx.To, amount)
-		collector.AddKillTxStakeTransfer(statsCollector, tx, stakeToTransfer)
+		stateDB.AddBalance(sender, stake)
+		collector.AddKillTxStakeTransfer(statsCollector, tx, stake)
 	case types.KillInviteeTx:
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		removeLinksWithInviterAndInvitees(stateDB, *tx.To)
 		inviteePrevState := stateDB.GetIdentityState(*tx.To)
 		stateDB.SetState(*tx.To, state.Killed)
 		appState.IdentityState.Remove(*tx.To)
-		stateDB.SubBalance(sender, fee)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
 		if inviteePrevState == state.Newbie {
 			stakeToTransfer := stateDB.GetStakeBalance(*tx.To)
 			stateDB.AddBalance(sender, stakeToTransfer)
+			stateDB.SubStake(*tx.To, stakeToTransfer)
 			collector.AddKillInviteeTxStakeTransfer(statsCollector, tx, stakeToTransfer)
 		}
 		if sender != stateDB.GodAddress() && stateDB.GetIdentityState(sender).VerifiedOrBetter() &&
@@ -849,77 +1010,125 @@ func (chain *Blockchain) ApplyTxOnState(appState *appstate.AppState, tx *types.T
 			stateDB.AddInvite(sender, 1)
 		}
 	case types.SubmitFlipTx:
-		stateDB.SubBalance(sender, fee)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		attachment := attachments.ParseFlipSubmitAttachment(tx)
 		stateDB.AddFlip(sender, attachment.Cid, attachment.Pair)
 	case types.OnlineStatusTx:
-		stateDB.SubBalance(sender, fee)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		stateDB.ToggleStatusSwitchAddress(sender)
 	case types.ChangeGodAddressTx:
-		stateDB.SubBalance(sender, fee)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		appState.State.SetGodAddress(*tx.To)
 	case types.ChangeProfileTx:
-		stateDB.SubBalance(sender, fee)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		attachment := attachments.ParseChangeProfileAttachment(tx)
 		stateDB.SetProfileHash(sender, attachment.Hash)
 	case types.DeleteFlipTx:
-		stateDB.SubBalance(sender, fee)
-		stateDB.SubBalance(sender, tx.TipsOrZero())
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		attachment := attachments.ParseDeleteFlipAttachment(tx)
 		stateDB.DeleteFlip(sender, attachment.Cid)
 	case types.SubmitAnswersHashTx, types.SubmitShortAnswersTx, types.EvidenceTx, types.SubmitLongAnswersTx:
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
 		stateDB.SetValidationTxBit(sender, tx.Type)
+	case types.DeployContract, types.CallContract, types.TerminateContract:
+		amount := tx.AmountOrZero()
+		if amount.Sign() > 0 && tx.Type == types.CallContract {
+			collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+			stateDB.SubBalance(sender, amount)
+			stateDB.AddBalance(*tx.To, amount)
+			collector.CompleteBalanceUpdate(statsCollector, appState)
+		}
+		receipt = vm.Run(tx, chain.getGasLimit(appState, tx))
+		if receipt.Error != nil {
+			chain.log.Error("contract err", "err", receipt.Error)
+		}
+		collector.BeginTxBalanceUpdate(statsCollector, tx, appState)
+		defer collector.CompleteBalanceUpdate(statsCollector, appState)
+
+		if !receipt.Success && tx.Type == types.CallContract {
+			stateDB.AddBalance(sender, amount)
+			stateDB.SubBalance(*tx.To, amount)
+		}
+		if receipt.Success && tx.Type == types.DeployContract {
+			stateDB.SubBalance(sender, amount)
+		}
+		receipt.GasCost = chain.GetGasCost(appState, receipt.GasUsed)
+		fee = fee.Add(fee, receipt.GasCost)
+		collector.AddTxReceipt(statsCollector, receipt, appState)
 	}
 
+	stateDB.SubBalance(sender, fee)
+	stateDB.SubBalance(sender, tx.TipsOrZero())
 	stateDB.SetNonce(sender, tx.AccountNonce)
 
 	if senderAccount.Epoch() != tx.Epoch {
 		stateDB.SetEpoch(sender, tx.Epoch)
 	}
+	collector.AddTxFee(statsCollector, fee)
 	collector.AddFeeBurntCoins(statsCollector, sender, fee, chain.config.Consensus.FeeBurnRate, tx)
 
-	return fee, nil
+	return fee, receipt, nil
 }
 
-func (chain *Blockchain) getTxFee(feePerByte *big.Int, tx *types.Transaction) *big.Int {
-	return fee.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), feePerByte, tx)
+func (chain *Blockchain) getTxFee(feePerGas *big.Int, tx *types.Transaction) *big.Int {
+	return fee.CalculateFee(chain.appState.ValidatorsCache.NetworkSize(), feePerGas, tx)
+}
+func (chain *Blockchain) GetGasCost(appState *appstate.AppState, gasUsed uint64) *big.Int {
+	feePerGas := appState.State.FeePerGas()
+	if common.ZeroOrNil(feePerGas) {
+		return common.Big0
+	}
+	return new(big.Int).Mul(feePerGas, big.NewInt(int64(gasUsed)))
 }
 
-func (chain *Blockchain) applyNextBlockFee(appState *appstate.AppState, block *types.Block) {
-	feePerByte := chain.calculateNextBlockFeePerByte(appState, block)
-	appState.State.SetFeePerByte(feePerByte)
+func (chain *Blockchain) getGasLimit(appState *appstate.AppState, tx *types.Transaction) int64 {
+	feePerGas := appState.State.FeePerGas()
+	txFee := chain.getTxFee(feePerGas, tx)
+	diff := new(big.Int).Sub(tx.MaxFeeOrZero(), txFee)
+
+	oneGasCost := chain.GetGasCost(appState, 1)
+	if oneGasCost.Sign() == 0 {
+		return 0
+	}
+	return math.ToInt(decimal.NewFromBigInt(diff, 0).Div(decimal.NewFromBigInt(oneGasCost, 0))).Int64()
 }
 
-func (chain *Blockchain) calculateNextBlockFeePerByte(appState *appstate.AppState, block *types.Block) *big.Int {
+func (chain *Blockchain) applyNextBlockFee(appState *appstate.AppState, block *types.Block, usedGas uint64) {
+	feePerGas := chain.calculateNextBlockFeePerGas(appState, block, usedGas)
+	appState.State.SetFeePerGas(feePerGas)
+}
 
-	minFeePerByte := fee.GetFeePerByteForNetwork(appState.ValidatorsCache.NetworkSize())
+func (chain *Blockchain) calculateNextBlockFeePerGas(appState *appstate.AppState, block *types.Block, usedGas uint64) *big.Int {
 
-	feePerByte := appState.State.FeePerByte()
-	if feePerByte == nil || feePerByte.Cmp(minFeePerByte) == -1 {
-		feePerByte = new(big.Int).Set(minFeePerByte)
+	minFeePerGas := fee.GetFeePerGasForNetwork(appState.ValidatorsCache.NetworkSize())
+
+	feePerGas := appState.State.FeePerGas()
+	if common.ZeroOrNil(feePerGas) || feePerGas.Cmp(minFeePerGas) == -1 {
+		feePerGas = new(big.Int).Set(minFeePerGas)
 	}
 
-	blockSize := len(block.Body.Bytes())
 	k := chain.config.Consensus.FeeSensitivityCoef
-	maxBlockSize := mempool.BlockBodySize
+	maxBlockGas := types.MaxBlockGas
 
-	// curBlockFee = prevBlockFee * (1 + k * (prevBlockSize / maxBlockSize - 0.5))
-	newFeePerByteD := decimal.New(int64(blockSize), 0).
-		Div(decimal.New(int64(maxBlockSize), 0)).
+	// curBlockFee = prevBlockFee * (1 + k * (prevBlockGas / maxBlockGas - 0.5))
+	newFeePerGasD := decimal.New(int64(usedGas), 0).
+		Div(decimal.New(int64(maxBlockGas), 0)).
 		Sub(decimal.NewFromFloat(0.5)).
 		Mul(decimal.NewFromFloat32(k)).
 		Add(decimal.New(1, 0)).
-		Mul(decimal.NewFromBigInt(feePerByte, 0))
+		Mul(decimal.NewFromBigInt(feePerGas, 0))
 
-	newFeePerByte := math.ToInt(newFeePerByteD)
-	if newFeePerByte.Cmp(minFeePerByte) == -1 {
-		newFeePerByte = new(big.Int).Set(minFeePerByte)
+	newFeePerGas := math.ToInt(newFeePerGasD)
+	if newFeePerGas.Cmp(minFeePerGas) == -1 {
+		newFeePerGas = new(big.Int).Set(minFeePerGas)
 	}
-	return newFeePerByte
+	return newFeePerGas
 }
 
 func (chain *Blockchain) applyVrfProposerThreshold(appState *appstate.AppState, block *types.Block) {
@@ -933,7 +1142,7 @@ func (chain *Blockchain) applyVrfProposerThreshold(appState *appstate.AppState, 
 
 	emptyBlocks := appState.State.EmptyBlocksCount()
 
-	minVrf := math2.Max(chain.config.Consensus.MinProposerThreshold, 1.0-10.0/online)
+	minVrf := math2.Max(chain.config.Consensus.MinProposerThreshold, 1.0-5.0/online)
 	maxVrf := math2.Max(chain.config.Consensus.MinProposerThreshold, 1.0-1.0/online)
 
 	step := (maxVrf - minVrf) / 60
@@ -963,8 +1172,8 @@ func (chain *Blockchain) applyStatusSwitch(appState *appstate.AppState, block *t
 	appState.State.ClearStatusSwitchAddresses()
 }
 
-func (chain *Blockchain) getTxCost(feePerByte *big.Int, tx *types.Transaction) *big.Int {
-	return fee.CalculateCost(chain.appState.ValidatorsCache.NetworkSize(), feePerByte, tx)
+func (chain *Blockchain) getTxCost(feePerGas *big.Int, tx *types.Transaction) *big.Int {
+	return fee.CalculateCost(chain.appState.ValidatorsCache.NetworkSize(), feePerGas, tx)
 }
 
 func getSeedData(prevBlock *types.Header) []byte {
@@ -973,46 +1182,67 @@ func getSeedData(prevBlock *types.Header) []byte {
 	return result
 }
 
-func (chain *Blockchain) GetProposerSortition() (bool, common.Hash, []byte) {
+func (chain *Blockchain) GetProposerSortition() (bool, []byte) {
 
 	if checkIfProposer(chain.coinBaseAddress, chain.appState) {
 		return chain.getSortition(chain.getProposerData(), chain.appState.State.VrfProposerThreshold())
 	}
 
-	return false, common.Hash{}, nil
+	return false, nil
 }
 
-func (chain *Blockchain) ProposeBlock() *types.BlockProposal {
+func (chain *Blockchain) ProposeBlock(proof []byte) *types.BlockProposal {
 	head := chain.Head
 
 	txs := chain.txpool.BuildBlockTransactions()
 	checkState, _ := chain.appState.ForCheck(chain.Head.Height())
 
-	filteredTxs, totalFee, totalTips := chain.filterTxs(checkState, txs)
-	body := &types.Body{
-		Transactions: filteredTxs,
-	}
-	var cid cid2.Cid
-	cid, _ = chain.ipfs.Cid(body.Bytes())
-
-	prevBlockTime := time.Unix(chain.Head.Time().Int64(), 0)
+	prevBlockTime := time.Unix(chain.Head.Time(), 0)
 	newBlockTime := prevBlockTime.Add(MinBlockDelay).Unix()
 	if localTime := time.Now().UTC().Unix(); localTime > newBlockTime {
 		newBlockTime = localTime
 	}
-	var cidBytes []byte
-	if cid != ipfs.EmptyCid {
-		cidBytes = cid.Bytes()
-	}
+
 	header := &types.ProposedHeader{
 		Height:         head.Height() + 1,
 		ParentHash:     head.Hash(),
-		Time:           new(big.Int).SetInt64(newBlockTime),
+		Time:           newBlockTime,
 		ProposerPubKey: chain.pubKey,
-		TxHash:         types.DeriveSha(types.Transactions(filteredTxs)),
-		IpfsHash:       cidBytes,
-		FeePerByte:     chain.appState.State.FeePerByte(),
+		FeePerGas:      chain.appState.State.FeePerGas(),
 	}
+
+	header.BlockSeed, header.SeedProof = chain.secStore.VrfEvaluate(getSeedData(head))
+	addr, flag := chain.offlineDetector.ProposeOffline(head)
+	if addr != nil {
+		header.OfflineAddr = addr
+		header.Flags |= flag
+	}
+
+	filteredTxs, totalFee, totalTips, receipts, usedGas := chain.filterTxs(checkState, txs, header)
+	body := &types.Body{
+		Transactions: filteredTxs,
+	}
+	var bodyCid cid2.Cid
+	var bodyCidBytes []byte
+
+	bodyCid, _ = chain.ipfs.Cid(body.ToBytes())
+	if bodyCid != ipfs.EmptyCid {
+		bodyCidBytes = bodyCid.Bytes()
+	}
+
+	receiptsBytes, _ := receipts.ToBytes()
+
+	var receiptsCid cid2.Cid
+	var receiptsCidBytes []byte
+	receiptsCid, _ = chain.ipfs.Cid(receiptsBytes)
+
+	if receiptsCid != ipfs.EmptyCid {
+		receiptsCidBytes = receiptsCid.Bytes()
+	}
+
+	header.IpfsHash = bodyCidBytes
+	header.TxHash = types.DeriveSha(types.Transactions(filteredTxs))
+	header.TxReceiptsCid = receiptsCidBytes
 
 	block := &types.Block{
 		Header: &types.Header{
@@ -1021,25 +1251,23 @@ func (chain *Blockchain) ProposeBlock() *types.BlockProposal {
 		Body: body,
 	}
 
-	block.Header.ProposedHeader.BlockSeed, block.Header.ProposedHeader.SeedProof = chain.secStore.VrfEvaluate(getSeedData(head))
+	block.Header.ProposedHeader.TxBloom = calculateTxBloom(block, receipts)
 
-	block.Header.ProposedHeader.TxBloom = calculateTxBloom(block)
+	block.Header.ProposedHeader.Flags |= chain.calculateFlags(checkState, block, head)
 
-	addr, flag := chain.offlineDetector.ProposeOffline(head)
-	if addr != nil {
-		block.Header.ProposedHeader.OfflineAddr = addr
-		block.Header.ProposedHeader.Flags |= flag
+	if chain.upgrader.CanUpgrade() && !block.Header.ProposedHeader.Flags.HasFlag(types.NewGenesis) {
+		header.Upgrade = chain.upgrader.UpgradeBits()
 	}
-	block.Header.ProposedHeader.Flags |= chain.calculateFlags(checkState, block)
 
-	block.Header.ProposedHeader.Root, block.Header.ProposedHeader.IdentityRoot, _ = chain.applyBlockOnState(checkState, block, chain.Head, totalFee, totalTips, nil)
+	block.Header.ProposedHeader.Root, block.Header.ProposedHeader.IdentityRoot, _ = chain.applyBlockOnState(checkState, block, chain.Head, totalFee, totalTips, usedGas, nil)
 
-	proposal := &types.BlockProposal{Block: block, Signature: chain.secStore.Sign(block.Hash().Bytes())}
-
+	proposal := &types.BlockProposal{Block: block, Proof: proof}
+	hash := crypto.SignatureHash(proposal)
+	proposal.Signature = chain.secStore.Sign(hash[:])
 	return proposal
 }
 
-func calculateTxBloom(block *types.Block) []byte {
+func calculateTxBloom(block *types.Block, receipts types.TxReceipts) []byte {
 	if block.IsEmpty() {
 		return []byte{}
 	}
@@ -1047,24 +1275,31 @@ func calculateTxBloom(block *types.Block) []byte {
 		return []byte{}
 	}
 
-	addrs := make(map[common.Address]bool)
+	values := make(map[string]struct{})
 
 	for _, tx := range block.Body.Transactions {
 		sender, _ := types.Sender(tx)
-		addrs[sender] = true
+		values[string(sender.Bytes())] = struct{}{}
 		if tx.To != nil {
-			addrs[*tx.To] = true
+			values[string(tx.To.Bytes())] = struct{}{}
 		}
 	}
-	bloom := common.NewSerializableBF(len(addrs))
-	for addr := range addrs {
-		bloom.Add(addr)
+
+	for _, r := range receipts {
+		for _, e := range r.Events {
+			values[string(append(r.ContractAddress.Bytes(), []byte(e.EventName)...))] = struct{}{}
+		}
+	}
+
+	bloom := common.NewSerializableBF(len(values))
+	for addr := range values {
+		bloom.Add([]byte(addr))
 	}
 	data, _ := bloom.Serialize()
 	return data
 }
 
-func (chain *Blockchain) calculateFlags(appState *appstate.AppState, block *types.Block) types.BlockFlag {
+func (chain *Blockchain) calculateFlags(appState *appstate.AppState, block *types.Block, prevBlock *types.Header) types.BlockFlag {
 
 	var flags types.BlockFlag
 
@@ -1094,8 +1329,7 @@ func (chain *Blockchain) calculateFlags(appState *appstate.AppState, block *type
 		flags |= types.AfterLongSessionStarted
 	}
 
-	if stateDb.ValidationPeriod() == state.AfterLongSessionPeriod &&
-		chain.timing.isValidationFinished(stateDb.NextValidationTime(), block.Header.Time(), appState.ValidatorsCache.NetworkSize()) {
+	if stateDb.ValidationPeriod() == state.AfterLongSessionPeriod && stateDb.BlocksCntWithoutCeremonialTxs() >= state.AfterLongRequiredBlocks {
 		flags |= types.ValidationFinished
 		flags |= types.IdentityUpdate
 	}
@@ -1112,28 +1346,42 @@ func (chain *Blockchain) calculateFlags(appState *appstate.AppState, block *type
 	if (flags.HasFlag(types.Snapshot) || block.Height()%chain.config.Consensus.StatusSwitchRange == 0) && len(appState.State.StatusSwitchAddresses()) > 0 {
 		flags |= types.IdentityUpdate
 	}
-
+	if prevBlock.ProposedHeader != nil && prevBlock.ProposedHeader.Upgrade > 0 && chain.config.Consensus.GenerateGenesisAfterUpgrade {
+		flags |= types.NewGenesis
+	}
 	return flags
 }
 
-func (chain *Blockchain) filterTxs(appState *appstate.AppState, txs []*types.Transaction) ([]*types.Transaction, *big.Int, *big.Int) {
+func (chain *Blockchain) filterTxs(appState *appstate.AppState, txs []*types.Transaction, header *types.ProposedHeader) ([]*types.Transaction, *big.Int, *big.Int, types.TxReceipts, uint64) {
 	var result []*types.Transaction
 
-	minFeePerByte := fee.GetFeePerByteForNetwork(appState.ValidatorsCache.NetworkSize())
+	minFeePerGas := fee.GetFeePerGasForNetwork(appState.ValidatorsCache.NetworkSize())
 
 	totalFee := new(big.Int)
 	totalTips := new(big.Int)
+	vm := vm.NewVmImpl(appState, &types.Header{ProposedHeader: header}, chain.secStore, nil)
+	var receipts []*types.TxReceipt
+	var usedGas uint64
 	for _, tx := range txs {
-		if err := validation.ValidateTx(appState, tx, minFeePerByte, validation.InBlockTx); err != nil {
+		if err := validation.ValidateTx(appState, tx, minFeePerGas, validation.InBlockTx); err != nil {
 			continue
 		}
-		if fee, err := chain.ApplyTxOnState(appState, tx, nil); err == nil {
-			totalFee.Add(totalFee, fee)
+		if f, r, err := chain.ApplyTxOnState(appState, vm, tx, nil); err == nil {
+			gas := uint64(fee.CalculateGas(tx))
+			if r != nil {
+				receipts = append(receipts, r)
+				gas += r.GasUsed
+			}
+			if usedGas+gas > types.MaxBlockGas {
+				break
+			}
+			usedGas += gas
+			totalFee.Add(totalFee, f)
 			totalTips.Add(totalTips, tx.TipsOrZero())
 			result = append(result, tx)
 		}
 	}
-	return result, totalFee, totalTips
+	return result, totalFee, totalTips, receipts, usedGas
 }
 
 func (chain *Blockchain) insertHeader(header *types.Header) {
@@ -1142,14 +1390,25 @@ func (chain *Blockchain) insertHeader(header *types.Header) {
 	chain.repo.WriteCanonicalHash(header.Height(), header.Hash())
 }
 
-func (chain *Blockchain) insertBlock(block *types.Block, diff *state.IdentityStateDiff) error {
-	_, err := chain.ipfs.Add(block.Body.Bytes(), chain.ipfs.ShouldPin(ipfs.Block))
+func (chain *Blockchain) insertBlock(block *types.Block, diff *state.IdentityStateDiff, receipts types.TxReceipts) error {
+	_, err := chain.ipfs.Add(block.Body.ToBytes(), chain.ipfs.ShouldPin(ipfs.Block))
 	if err != nil {
 		return errors.Wrap(BlockInsertionErr, err.Error())
 	}
+	if receipts != nil {
+		data, _ := receipts.ToBytes()
+		_, err := chain.ipfs.Add(data, chain.ipfs.ShouldPin(ipfs.TxReceipt))
+		if err != nil {
+			return errors.Wrap(BlockInsertionErr, err.Error())
+		}
+	}
+
 	chain.insertHeader(block.Header)
 	chain.WriteIdentityStateDiff(block.Height(), diff)
 	chain.WriteTxIndex(block.Hash(), block.Body.Transactions)
+	if receipts != nil {
+		chain.WriteTxReceipts(block.Header.ProposedHeader.TxReceiptsCid, receipts)
+	}
 	chain.indexer.HandleBlockTransactions(block.Header, block.Body.Transactions)
 	chain.setCurrentHead(block.Header)
 	return nil
@@ -1159,9 +1418,36 @@ func (chain *Blockchain) WriteTxIndex(hash common.Hash, txs types.Transactions) 
 	for i, tx := range txs {
 		idx := &types.TransactionIndex{
 			BlockHash: hash,
-			Idx:       uint16(i),
+			Idx:       uint32(i),
 		}
 		chain.repo.WriteTxIndex(tx.Hash(), idx)
+	}
+}
+
+func (chain *Blockchain) WriteTxReceipts(cid []byte, receipts types.TxReceipts) {
+	m := make(map[common.Address]map[string]struct{})
+	for _, s := range chain.subManager.Subscriptions() {
+		eventMap, ok := m[s.Contract]
+		if !ok {
+			eventMap = make(map[string]struct{})
+			m[s.Contract] = eventMap
+		}
+		eventMap[s.Event] = struct{}{}
+	}
+
+	for i, r := range receipts {
+		idx := &types.TxReceiptIndex{
+			Idx:        uint32(i),
+			ReceiptCid: cid,
+		}
+		chain.repo.WriteReceiptIndex(r.TxHash, idx)
+		if eventMap, ok := m[r.ContractAddress]; ok {
+			for idx, event := range r.Events {
+				if _, ok := eventMap[event.EventName]; ok {
+					chain.repo.WriteEvent(r.ContractAddress, r.TxHash, uint32(idx), event)
+				}
+			}
+		}
 	}
 }
 
@@ -1173,17 +1459,18 @@ func (chain *Blockchain) getProposerData() []byte {
 	return result
 }
 
-func (chain *Blockchain) getSortition(data []byte, threshold float64) (bool, common.Hash, []byte) {
+func (chain *Blockchain) getSortition(data []byte, threshold float64) (bool, []byte) {
 	hash, proof := chain.secStore.VrfEvaluate(data)
 
 	v := new(big.Float).SetInt(new(big.Int).SetBytes(hash[:]))
 
-	q := new(big.Float).Quo(v, MaxHash).SetPrec(10)
+	q := new(big.Float).Quo(v, MaxHash)
+	vrfThreshold := new(big.Float).SetFloat64(threshold)
 
-	if f, _ := q.Float64(); f >= threshold {
-		return true, hash, proof
+	if q.Cmp(vrfThreshold) >= 0 {
+		return true, proof
 	}
-	return false, common.Hash{}, nil
+	return false, nil
 }
 
 func (chain *Blockchain) validateBlock(checkState *appstate.AppState, block *types.Block, prevBlock *types.Header) error {
@@ -1199,7 +1486,7 @@ func (chain *Blockchain) validateBlock(checkState *appstate.AppState, block *typ
 		return err
 	}
 
-	if checkState.State.FeePerByte().Cmp(block.Header.ProposedHeader.FeePerByte) != 0 {
+	if !common.ZeroOrNil(block.Header.ProposedHeader.FeePerGas) && checkState.State.FeePerGas().Cmp(block.Header.ProposedHeader.FeePerGas) != 0 {
 		return errors.New("fee rate is invalid")
 	}
 
@@ -1215,27 +1502,29 @@ func (chain *Blockchain) validateBlock(checkState *appstate.AppState, block *typ
 		return errors.New("txHash is invalid")
 	}
 
-	if bytes.Compare(calculateTxBloom(block), block.Header.ProposedHeader.TxBloom) != 0 {
-		return errors.New("tx bloom is invalid")
-	}
-
 	var totalFee, totalTips *big.Int
 	var err error
-	if totalFee, totalTips, err = chain.processTxs(checkState, block, nil); err != nil {
+	var receipts types.TxReceipts
+	var usedGas uint64
+	if totalFee, totalTips, receipts, usedGas, err = chain.processTxs(checkState, block, nil); err != nil {
 		return err
+	}
+
+	if bytes.Compare(calculateTxBloom(block, receipts), block.Header.ProposedHeader.TxBloom) != 0 {
+		return errors.New("tx bloom is invalid")
 	}
 
 	persistentFlags := block.Header.ProposedHeader.Flags.UnsetFlag(types.OfflinePropose).UnsetFlag(types.OfflineCommit)
 
-	if expected := chain.calculateFlags(checkState, block); expected != persistentFlags {
+	if expected := chain.calculateFlags(checkState, block, prevBlock); expected != persistentFlags {
 		return errors.Errorf("flags are invalid, expected=%v, actual=%v", expected, persistentFlags)
 	}
 
-	if root, identityRoot, _ := chain.applyBlockOnState(checkState, block, prevBlock, totalFee, totalTips, nil); root != block.Root() || identityRoot != block.IdentityRoot() {
+	if root, identityRoot, _ := chain.applyBlockOnState(checkState, block, prevBlock, totalFee, totalTips, usedGas, nil); root != block.Root() || identityRoot != block.IdentityRoot() {
 		return errors.Errorf("invalid block roots. Expected=%x & %x, actual=%x & %x", root, identityRoot, block.Root(), block.IdentityRoot())
 	}
 
-	cid, _ := chain.ipfs.Cid(block.Body.Bytes())
+	cid, _ := chain.ipfs.Cid(block.Body.ToBytes())
 
 	var cidBytes []byte
 	if cid != ipfs.EmptyCid {
@@ -1244,7 +1533,17 @@ func (chain *Blockchain) validateBlock(checkState *appstate.AppState, block *typ
 	if bytes.Compare(cidBytes, block.Header.ProposedHeader.IpfsHash) != 0 {
 		return errors.New("invalid block cid")
 	}
-
+	var receiptCidBytes []byte
+	if receipts != nil {
+		data, _ := receipts.ToBytes()
+		cidReceipt, _ := chain.ipfs.Cid(data)
+		if cidReceipt != ipfs.EmptyCid {
+			receiptCidBytes = cidReceipt.Bytes()
+		}
+	}
+	if bytes.Compare(receiptCidBytes, block.Header.ProposedHeader.TxReceiptsCid) != 0 {
+		return errors.New("invalid receipt cid")
+	}
 	return nil
 }
 
@@ -1318,12 +1617,12 @@ func validateBlockParentHash(block *types.Header, prevBlock *types.Header) error
 }
 
 func validateBlockTimestamp(block *types.Header, prevBlock *types.Header) error {
-	blockTime := time.Unix(block.Time().Int64(), 0)
+	blockTime := time.Unix(block.Time(), 0)
 
 	if blockTime.Sub(time.Now().UTC()) > MaxFutureBlockOffset {
 		return errors.New("block from future")
 	}
-	prevBlockTime := time.Unix(prevBlock.Time().Int64(), 0)
+	prevBlockTime := time.Unix(prevBlock.Time(), 0)
 
 	if blockTime.Sub(prevBlockTime) < MinBlockDelay {
 		return errors.Errorf("block is too close to previous one, prev: %v, current: %v", prevBlockTime.Unix(), blockTime.Unix())
@@ -1332,7 +1631,7 @@ func validateBlockTimestamp(block *types.Header, prevBlock *types.Header) error 
 	return nil
 }
 
-func (chain *Blockchain) ValidateProposerProof(proof []byte, hash common.Hash, pubKeyData []byte) error {
+func (chain *Blockchain) ValidateProposerProof(proof []byte, pubKeyData []byte) error {
 	pubKey, err := crypto.UnmarshalPubkey(pubKeyData)
 	if err != nil {
 		return err
@@ -1344,15 +1643,12 @@ func (chain *Blockchain) ValidateProposerProof(proof []byte, hash common.Hash, p
 
 	h, err := verifier.ProofToHash(chain.getProposerData(), proof)
 
-	if h != hash {
-		return errors.New("Hashes are not equal")
-	}
+	v := new(big.Float).SetInt(new(big.Int).SetBytes(h[:]))
 
-	v := new(big.Float).SetInt(new(big.Int).SetBytes(hash[:]))
+	vrfThreshold := new(big.Float).SetFloat64(chain.appState.State.VrfProposerThreshold())
+	q := new(big.Float).Quo(v, MaxHash)
 
-	q := new(big.Float).Quo(v, MaxHash).SetPrec(10)
-
-	if f, _ := q.Float64(); f < chain.appState.State.VrfProposerThreshold() {
+	if q.Cmp(vrfThreshold) == -1 {
 		return errors.New("Proposer is invalid")
 	}
 
@@ -1436,6 +1732,23 @@ func (chain *Blockchain) GetTxIndex(hash common.Hash) *types.TransactionIndex {
 	return chain.repo.ReadTxIndex(hash)
 }
 
+func (chain *Blockchain) GetReceipt(hash common.Hash) *types.TxReceipt {
+	idx := chain.repo.ReadReceiptIndex(hash)
+	if idx == nil {
+		return nil
+	}
+	data, err := chain.ipfs.Get(idx.ReceiptCid, ipfs.TxReceipt)
+	if err != nil {
+		return nil
+	}
+	r := types.TxReceipts{}
+	r = r.FromBytes(data)
+	if len(r) < int(idx.Idx) {
+		return nil
+	}
+	return r[idx.Idx]
+}
+
 func (chain *Blockchain) GetTx(hash common.Hash) (*types.Transaction, *types.TransactionIndex) {
 	idx := chain.repo.ReadTxIndex(hash)
 	if idx == nil {
@@ -1453,7 +1766,7 @@ func (chain *Blockchain) GetTx(hash common.Hash) (*types.Transaction, *types.Tra
 	body := &types.Body{}
 	body.FromBytes(data)
 
-	if uint16(len(body.Transactions)) < idx.Idx {
+	if uint32(len(body.Transactions)) < idx.Idx {
 		return nil, nil
 	}
 	tx := body.Transactions[idx.Idx]
@@ -1474,7 +1787,7 @@ func (chain *Blockchain) GetCommitteeSize(vc *validators.ValidatorsCache, final 
 		return cnt
 	}
 
-	size := int(float64(cnt) * percent)
+	size := int(math2.Round(float64(cnt) * percent))
 	if size > chain.config.Consensus.MaxCommitteeSize {
 		return chain.config.Consensus.MaxCommitteeSize
 	}
@@ -1497,11 +1810,11 @@ func (chain *Blockchain) GetCommitteeVotesThreshold(vc *validators.ValidatorsCac
 		return 5
 	}
 	size := chain.GetCommitteeSize(vc, final)
-	return int(float64(size) * chain.config.Consensus.AgreementThreshold)
+	return int(math2.Round(float64(size) * chain.config.Consensus.AgreementThreshold))
 }
 
-func (chain *Blockchain) Genesis() common.Hash {
-	return chain.genesis.Hash()
+func (chain *Blockchain) GenesisInfo() *types.GenesisInfo {
+	return chain.genesisInfo
 }
 
 func (chain *Blockchain) ValidateSubChain(startHeight uint64, blocks []types.BlockBundle) error {
@@ -1563,7 +1876,7 @@ func (chain *Blockchain) EnsureIntegrity() error {
 		chain.Head.IdentityRoot() != chain.appState.IdentityState.Root() {
 		wasReset = true
 		resetTo := uint64(0)
-		for h, tryCnt := chain.Head.Height()-1, 0; h >= 1 && tryCnt < int(state.SyncTreeKeepEvery)+1; h, tryCnt = h-1, tryCnt+1 {
+		for h, tryCnt := chain.Head.Height()-1, 0; h >= 1 && tryCnt < int(state.MaxSavedStatesCount)+1; h, tryCnt = h-1, tryCnt+1 {
 			if chain.appState.IdentityState.HasVersion(h) {
 				resetTo = h
 				break
@@ -1651,6 +1964,21 @@ func (chain *Blockchain) ValidateHeader(header, prevBlock *types.Header) error {
 	if hash != header.Seed() {
 		return errors.New("seed is invalid")
 	}
+	if header.Flags().HasFlag(types.NewGenesis) {
+		if header.ProposedHeader.Upgrade != 0 || prevBlock.ProposedHeader == nil ||
+			prevBlock.ProposedHeader.Upgrade == 0 ||
+			!chain.config.Consensus.GenerateGenesisAfterUpgrade {
+			return errors.New("flag NewGenesis is invalid")
+		}
+	}
+	if prevBlock.ProposedHeader != nil && prevBlock.ProposedHeader.Upgrade > 0 && chain.config.Consensus.GenerateGenesisAfterUpgrade {
+		if !header.Flags().HasFlag(types.NewGenesis) {
+			return errors.New("flag NewGenesis is required")
+		}
+	}
+	if header.ProposedHeader != nil && header.ProposedHeader.Upgrade > 0 && header.ProposedHeader.Upgrade != uint32(chain.upgrader.Target()) {
+		return errors.New("unknown consensus upgrade")
+	}
 	//TODO: add proposer's check??
 
 	return nil
@@ -1661,13 +1989,12 @@ func (chain *Blockchain) GetCertificate(hash common.Hash) *types.BlockCert {
 }
 
 func (chain *Blockchain) GetIdentityDiff(height uint64) *state.IdentityStateDiff {
-
 	data := chain.repo.ReadIdentityStateDiff(height)
 	if data == nil {
 		return nil
 	}
 	diff := new(state.IdentityStateDiff)
-	rlp.DecodeBytes(data, diff)
+	diff.FromBytes(data)
 	return diff
 }
 
@@ -1689,7 +2016,8 @@ func (chain *Blockchain) ReadPreliminaryHead() *types.Header {
 
 func (chain *Blockchain) WriteIdentityStateDiff(height uint64, diff *state.IdentityStateDiff) {
 	if !diff.Empty() {
-		chain.repo.WriteIdentityStateDiff(height, diff.Bytes())
+		b, _ := diff.ToBytes()
+		chain.repo.WriteIdentityStateDiff(height, b)
 	}
 }
 
@@ -1701,8 +2029,8 @@ func (chain *Blockchain) RemovePreliminaryHead(batch dbm.Batch) {
 }
 
 func (chain *Blockchain) IsPermanentCert(header *types.Header) bool {
-	return header.Flags().HasFlag(types.IdentityUpdate|types.Snapshot) ||
-		header.Height()%chain.config.Blockchain.StoreCertRange == 0
+	return header.Flags().HasFlag(types.IdentityUpdate|types.Snapshot|types.NewGenesis) ||
+		header.Height()%chain.config.Blockchain.StoreCertRange == 0 || header.ProposedHeader != nil && header.ProposedHeader.Upgrade > 0
 }
 
 func (chain *Blockchain) ReadTxs(address common.Address, count int, token []byte) ([]*types.SavedTransaction, []byte) {
@@ -1713,13 +2041,13 @@ func (chain *Blockchain) ReadTotalBurntCoins() []*types.BurntCoins {
 	return chain.repo.GetTotalBurntCoins()
 }
 
-func readPredefinedState() (*state.PredefinedState, error) {
+func readPredefinedState() (*models.ProtoPredefinedState, error) {
 	data, err := Asset("stategen.out")
 	if err != nil {
 		return nil, err
 	}
-	predefinedState := new(state.PredefinedState)
-	if err := rlp.DecodeBytes(data, predefinedState); err != nil {
+	predefinedState := new(models.ProtoPredefinedState)
+	if err := proto.Unmarshal(data, predefinedState); err != nil {
 		return nil, err
 	}
 	return predefinedState, nil
@@ -1797,14 +2125,30 @@ func (chain *Blockchain) AtomicSwitchToPreliminary(manifest *snapshot.Manifest) 
 	}
 	defer batch.Close()
 
-	oldStateDb := chain.appState.State.CommitSnapshot(manifest, batch)
+	oldStateDb := chain.appState.State.CommitSnapshot(manifest.Height, batch)
 	chain.appState.ValidatorsCache.Load()
 
 	chain.setHead(chain.PreliminaryHead.Height(), batch)
 	newHead := chain.PreliminaryHead
 	chain.RemovePreliminaryHead(batch)
+
+	consensusVersion := chain.ReadPreliminaryConsensusVersion()
+	if consensusVersion > 0 {
+		chain.repo.WriteConsensusVersion(batch, consensusVersion)
+		chain.repo.RemovePreliminaryConsensusVersion(batch)
+	}
+	preliminaryIntermediateGenesis := chain.repo.ReadPreliminaryIntermediateGenesis()
+	if preliminaryIntermediateGenesis > 0 {
+		chain.repo.WriteIntermediateGenesis(batch, preliminaryIntermediateGenesis)
+		chain.repo.RemovePreliminaryIntermediateGenesis(batch)
+	}
 	if err := batch.WriteSync(); err != nil {
 		return err
+	}
+	if preliminaryIntermediateGenesis > 0 {
+		hash := chain.repo.ReadCanonicalHash(preliminaryIntermediateGenesis)
+		chain.genesisInfo.OldGenesis = chain.genesisInfo.Genesis
+		chain.genesisInfo.Genesis = chain.repo.ReadBlockHeader(hash)
 	}
 	chain.setCurrentHead(newHead)
 	go func() {
@@ -1812,4 +2156,28 @@ func (chain *Blockchain) AtomicSwitchToPreliminary(manifest *snapshot.Manifest) 
 		common.ClearDb(oldStateDb)
 	}()
 	return nil
+}
+
+func (chain *Blockchain) ReadEvents(contract common.Address) []*types.SavedEvent {
+	return chain.repo.GetSavedEvents(contract)
+}
+
+func (chain *Blockchain) WritePreliminaryConsensusVersion(ver uint32) {
+	chain.repo.WritePreliminaryConsensusVersion(ver)
+}
+
+func (chain *Blockchain) ReadPreliminaryConsensusVersion() uint32 {
+	return chain.repo.ReadPreliminaryConsensusVersion()
+}
+
+func (chain *Blockchain) RemovePreliminaryConsensusVersion() {
+	chain.repo.RemovePreliminaryConsensusVersion(nil)
+}
+
+func (chain *Blockchain) WritePreliminaryIntermediateGenesis(height uint64) {
+	chain.repo.WritePreliminaryIntermediateGenesis(height)
+}
+
+func (chain *Blockchain) RemovePreliminaryIntermediateGenesis() {
+	chain.repo.RemovePreliminaryIntermediateGenesis(nil)
 }

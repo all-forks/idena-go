@@ -7,12 +7,13 @@ import (
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/core/appstate"
+	"github.com/idena-network/idena-go/core/upgrade"
+	"github.com/idena-network/idena-go/crypto/vrf"
 	"github.com/idena-network/idena-go/log"
 	"github.com/libp2p/go-libp2p-core/peer"
 	"github.com/patrickmn/go-cache"
 	"github.com/pkg/errors"
 	"github.com/shopspring/decimal"
-	"sort"
 	"sync"
 	"time"
 )
@@ -21,20 +22,11 @@ const (
 	DeferFutureProposalsPeriod = 30
 )
 
-type Proof struct {
-	Proof  []byte
-	Hash   common.Hash
-	PubKey []byte
-	Round  uint64
-}
-
 type Proposals struct {
 	log             log.Logger
 	chain           *blockchain.Blockchain
 	offlineDetector *blockchain.OfflineDetector
-
-	// proofs of proposers which are valid for current round
-	proofsByRound *sync.Map
+	upgrader        *upgrade.Upgrader
 
 	// proposed blocks are grouped by round
 	blocksByRound *sync.Map
@@ -48,6 +40,10 @@ type Proposals struct {
 	// used for requesting blocks by hash from peers
 	blockCache *cache.Cache
 	appState   *appstate.AppState
+
+	// proposals with worse proof can be skipped
+	bestProofs      map[uint64]bestHash
+	bestProofsMutex sync.RWMutex
 }
 
 type blockPeer struct {
@@ -61,87 +57,91 @@ type proposedBlock struct {
 	receivingTime time.Time
 }
 
-func NewProposals(chain *blockchain.Blockchain, appState *appstate.AppState, detector *blockchain.OfflineDetector) (*Proposals, *sync.Map, *sync.Map) {
+type bestHash struct {
+	common.Hash
+	ProposerPubKey []byte
+}
+
+type ProposerByRound func(round uint64) (hash common.Hash, proposer []byte, ok bool)
+
+func NewProposals(chain *blockchain.Blockchain, appState *appstate.AppState, detector *blockchain.OfflineDetector, upgrader *upgrade.Upgrader) (*Proposals, *sync.Map) {
 	p := &Proposals{
 		chain:                chain,
 		appState:             appState,
 		offlineDetector:      detector,
+		upgrader:             upgrader,
 		log:                  log.New(),
-		proofsByRound:        &sync.Map{},
 		blocksByRound:        &sync.Map{},
 		pendingBlocks:        &sync.Map{},
 		pendingProofs:        &sync.Map{},
 		potentialForkedPeers: mapset.NewSet(),
 		proposeCache:         cache.New(30*time.Second, 1*time.Minute),
 		blockCache:           cache.New(time.Minute, time.Minute),
+		bestProofs:           map[uint64]bestHash{},
 	}
-	return p, p.proofsByRound, p.pendingProofs
+	return p, p.pendingProofs
 }
 
-func (proposals *Proposals) AddProposeProof(p []byte, hash common.Hash, pubKey []byte, round uint64) (added bool, pending bool) {
-	currentRound := proposals.chain.Round()
-	proof := &Proof{
-		p,
-		hash,
-		pubKey,
-		round,
+func (proposals *Proposals) ProposerByRound(round uint64) (hash common.Hash, proposer []byte, ok bool) {
+	proposals.bestProofsMutex.RLock()
+	defer proposals.bestProofsMutex.RUnlock()
+	bestHash, ok := proposals.bestProofs[round]
+	if ok {
+		return bestHash.Hash, bestHash.ProposerPubKey, ok
 	}
-	if round == currentRound {
+	return common.Hash{}, nil, false
+}
+
+func (proposals *Proposals) AddProposeProof(proposal *types.ProofProposal) (added bool, pending bool) {
+	currentRound := proposals.chain.Round()
+
+	h, err := vrf.HashFromProof(proposal.Proof)
+	if err != nil {
+		return false, false
+	}
+	hash := common.Hash(h)
+
+	if proposal.Round == currentRound {
 		if proposals.proposeCache.Add(hash.Hex(), nil, cache.DefaultExpiration) != nil {
 			return false, false
 		}
 
-		m, _ := proposals.proofsByRound.LoadOrStore(round, &sync.Map{})
-		byRound := m.(*sync.Map)
-		if _, ok := byRound.Load(hash); ok {
+		if !proposals.compareWithBestHash(currentRound, hash) {
 			return false, false
 		}
 
-		if err := proposals.chain.ValidateProposerProof(p, hash, pubKey); err != nil {
+		pubKey, err := types.ProofProposalPubKey(proposal)
+		if err != nil {
 			return false, false
 		}
-		byRound.Store(hash, proof)
+
+		if err := proposals.chain.ValidateProposerProof(proposal.Proof, pubKey); err != nil {
+			log.Warn("Failed proposed proof validation", "err", err)
+			return false, false
+		}
+
+		proposals.setBestHash(currentRound, hash, pubKey)
+
 		return true, false
-	} else if currentRound < round && round-currentRound < DeferFutureProposalsPeriod {
-		proposals.pendingProofs.LoadOrStore(proof.Hash, proof)
+	} else if currentRound < proposal.Round && proposal.Round-currentRound < DeferFutureProposalsPeriod {
+		proposals.pendingProofs.LoadOrStore(hash, proposal)
 		return false, true
 	}
 	return false, false
 }
 
 func (proposals *Proposals) GetProposerPubKey(round uint64) []byte {
-	m, ok := proposals.proofsByRound.Load(round)
+
+	proposals.bestProofsMutex.RLock()
+	defer proposals.bestProofsMutex.RUnlock()
+	bestHash, ok := proposals.bestProofs[round]
 	if ok {
-
-		byRound := m.(*sync.Map)
-		var list []common.Hash
-		byRound.Range(func(key, value interface{}) bool {
-			list = append(list, key.(common.Hash))
-			return true
-		})
-		if len(list) == 0 {
-			return nil
-		}
-
-		sort.SliceStable(list, func(i, j int) bool {
-			return bytes.Compare(list[i][:], list[j][:]) > 0
-		})
-
-		v, ok := byRound.Load(list[0])
-		if ok {
-			return v.(*Proof).PubKey
-		}
+		return bestHash.ProposerPubKey
 	}
 	return nil
 }
 
 func (proposals *Proposals) CompleteRound(height uint64) {
-	proposals.proofsByRound.Range(func(key, value interface{}) bool {
-		if key.(uint64) <= height {
-			proposals.proofsByRound.Delete(key)
-		}
-		return true
-	})
 
 	proposals.blocksByRound.Range(func(key, value interface{}) bool {
 		if key.(uint64) <= height {
@@ -149,14 +149,22 @@ func (proposals *Proposals) CompleteRound(height uint64) {
 		}
 		return true
 	})
+
+	proposals.bestProofsMutex.Lock()
+	for round, _ := range proposals.bestProofs {
+		if round <= height {
+			delete(proposals.bestProofs, round)
+		}
+	}
+	proposals.bestProofsMutex.Unlock()
 }
 
-func (proposals *Proposals) ProcessPendingProofs() []*Proof {
-	var result []*Proof
+func (proposals *Proposals) ProcessPendingProofs() []*types.ProofProposal {
+	var result []*types.ProofProposal
 
 	proposals.pendingProofs.Range(func(key, value interface{}) bool {
-		proof := value.(*Proof)
-		if added, pending := proposals.AddProposeProof(proof.Proof, proof.Hash, proof.PubKey, proof.Round); added {
+		proof := value.(*types.ProofProposal)
+		if added, pending := proposals.AddProposeProof(proof); added {
 			result = append(result, proof)
 		} else if !pending {
 			proposals.pendingProofs.Delete(key)
@@ -193,13 +201,25 @@ func (proposals *Proposals) ProcessPendingBlocks() []*types.BlockProposal {
 }
 
 func (proposals *Proposals) AddProposedBlock(proposal *types.BlockProposal, peerId peer.ID, receivingTime time.Time, checkState *appstate.AppState) (added bool, pending bool) {
-	if !proposal.IsValid() {
-		return false, false
-	}
 	block := proposal.Block
 	currentRound := proposals.chain.Round()
 	if currentRound == block.Height() {
 		if proposals.proposeCache.Add(block.Hash().Hex(), nil, cache.DefaultExpiration) != nil {
+			return false, false
+		}
+
+		h, err := vrf.HashFromProof(proposal.Proof)
+		if err != nil {
+			return false, false
+		}
+		vrfHash := common.Hash(h)
+
+		if !proposals.compareWithBestHash(currentRound, vrfHash) {
+			return false, false
+		}
+
+		if err := proposals.chain.ValidateProposerProof(proposal.Proof, block.Header.ProposedHeader.ProposerPubKey); err != nil {
+			log.Warn("Failed proposed block proof validation", "err", err)
 			return false, false
 		}
 
@@ -210,7 +230,7 @@ func (proposals *Proposals) AddProposedBlock(proposal *types.BlockProposal, peer
 			return false, false
 		}
 		if err := proposals.chain.ValidateBlock(block, checkState); err != nil {
-			log.Warn("Failed proposed block validation", "err", err.Error())
+			log.Warn("Failed proposed block validation", "err", err)
 			// it might be a signal about a fork
 			if err == blockchain.ParentHashIsInvalid && peerId != "" {
 				proposals.potentialForkedPeers.Add(peerId)
@@ -222,9 +242,13 @@ func (proposals *Proposals) AddProposedBlock(proposal *types.BlockProposal, peer
 			log.Warn("Failed block offline proposing", "err", err.Error())
 			return false, false
 		}
+		if err := proposals.upgrader.ValidateBlock(block); err != nil {
+			log.Warn("Failed block upgrading proposing", "err", err.Error())
+			return false, false
+		}
 
 		round.Store(block.Hash(), &proposedBlock{proposal: proposal, receivingTime: receivingTime})
-
+		proposals.setBestHash(currentRound, vrfHash, block.Header.ProposedHeader.ProposerPubKey)
 		return true, false
 	} else if currentRound < block.Height() && block.Height()-currentRound < DeferFutureProposalsPeriod {
 		proposals.pendingBlocks.LoadOrStore(block.Hash(), &blockPeer{
@@ -287,7 +311,7 @@ func (proposals *Proposals) AvgTimeDiff(round uint64, start int64) decimal.Decim
 		round := m.(*sync.Map)
 		round.Range(func(key, value interface{}) bool {
 			block := value.(*proposedBlock)
-			diffs = append(diffs, decimal.New(block.receivingTime.Unix(), 0).Sub(decimal.NewFromBigInt(block.proposal.Header.Time(), 0)))
+			diffs = append(diffs, decimal.New(block.receivingTime.Unix(), 0).Sub(decimal.New(block.proposal.Header.Time(), 0)))
 			return true
 		})
 	}
@@ -317,4 +341,29 @@ func (proposals *Proposals) GetBlock(hash common.Hash) *types.Block {
 		return nil
 	}
 	return block.(*types.Block)
+}
+
+func (proposals *Proposals) compareWithBestHash(round uint64, hash common.Hash) bool {
+	proposals.bestProofsMutex.RLock()
+	defer proposals.bestProofsMutex.RUnlock()
+	if bestHash, ok := proposals.bestProofs[round]; ok {
+		return bytes.Compare(hash[:], bestHash.Hash[:]) >= 0
+	}
+	return true
+}
+
+func (proposals *Proposals) setBestHash(round uint64, hash common.Hash, proposerPubKey []byte) {
+	proposals.bestProofsMutex.Lock()
+	defer proposals.bestProofsMutex.Unlock()
+	if stored, ok := proposals.bestProofs[round]; ok {
+		if bytes.Compare(hash[:], stored.Hash[:]) >= 0 {
+			proposals.bestProofs[round] = bestHash{
+				hash, proposerPubKey,
+			}
+		}
+	} else {
+		proposals.bestProofs[round] = bestHash{
+			hash, proposerPubKey,
+		}
+	}
 }

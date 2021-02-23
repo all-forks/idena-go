@@ -1,12 +1,10 @@
 package node
 
 import (
-	"bytes"
-	"crypto/ecdsa"
 	"fmt"
 	"github.com/idena-network/idena-go/api"
 	"github.com/idena-network/idena-go/blockchain"
-	"github.com/idena-network/idena-go/common"
+	"github.com/idena-network/idena-go/blockchain/validation"
 	"github.com/idena-network/idena-go/common/eventbus"
 	util "github.com/idena-network/idena-go/common/ulimit"
 	"github.com/idena-network/idena-go/config"
@@ -17,16 +15,18 @@ import (
 	"github.com/idena-network/idena-go/core/mempool"
 	"github.com/idena-network/idena-go/core/profile"
 	"github.com/idena-network/idena-go/core/state"
+	"github.com/idena-network/idena-go/core/upgrade"
 	"github.com/idena-network/idena-go/crypto"
+	"github.com/idena-network/idena-go/deferredtx"
 	"github.com/idena-network/idena-go/ipfs"
 	"github.com/idena-network/idena-go/keystore"
 	"github.com/idena-network/idena-go/log"
 	"github.com/idena-network/idena-go/pengings"
 	"github.com/idena-network/idena-go/protocol"
-	"github.com/idena-network/idena-go/rlp"
 	"github.com/idena-network/idena-go/rpc"
 	"github.com/idena-network/idena-go/secstore"
 	"github.com/idena-network/idena-go/stats/collector"
+	"github.com/idena-network/idena-go/subscriptions"
 	"github.com/pkg/errors"
 	"net"
 	"os"
@@ -64,6 +64,9 @@ type Node struct {
 	offlineDetector *blockchain.OfflineDetector
 	appVersion      string
 	profileManager  *profile.Manager
+	deferJob        *deferredtx.Job
+	subManager      *subscriptions.Manager
+	upgrader        *upgrade.Upgrader
 }
 
 type NodeCtx struct {
@@ -74,8 +77,17 @@ type NodeCtx struct {
 	Flipper         *flip.Flipper
 	KeysPool        *mempool.KeysPool
 	OfflineDetector *blockchain.OfflineDetector
-	ProofsByRound   *sync.Map
 	PendingProofs   *sync.Map
+	ProposerByRound pengings.ProposerByRound
+	Upgrader        *upgrade.Upgrader
+}
+
+type ceremonyChecker struct {
+	appState *appstate.AppState
+}
+
+func (checker *ceremonyChecker) IsRunning() bool {
+	return checker.appState.State.ValidationPeriod() >= state.FlipLotteryPeriod
 }
 
 func StartMobileNode(path string, cfg string) string {
@@ -142,27 +154,47 @@ func NewNodeWithInjections(config *config.Config, bus eventbus.Bus, statsCollect
 	if err != nil {
 		return nil, err
 	}
-
+	validation.SetAppConfig(config)
 	keyStore := keystore.NewKeyStore(keyStoreDir, keystore.StandardScryptN, keystore.StandardScryptP)
 	secStore := secstore.NewSecStore()
-	appState := appstate.NewAppState(db, bus)
+
+	appState, err := appstate.NewAppState(db, bus)
+	if err != nil {
+		return nil, err
+	}
 
 	offlineDetector := blockchain.NewOfflineDetector(config, db, appState, secStore, bus)
-	votes := pengings.NewVotes(appState, bus, offlineDetector)
 
-	txpool := mempool.NewTxPool(appState, bus, config.Mempool)
+	upgrader := upgrade.NewUpgrader(config, appState, db)
+
+	votes := pengings.NewVotes(appState, bus, offlineDetector, upgrader)
+
+	txpool := mempool.NewTxPool(appState, bus, config.Mempool, statsCollector)
 	flipKeyPool := mempool.NewKeysPool(db, appState, bus, secStore)
 
-	chain := blockchain.NewBlockchain(config, db, txpool, appState, ipfsProxy, secStore, bus, offlineDetector, keyStore)
-	proposals, proofsByRound, pendingProofs := pengings.NewProposals(chain, appState, offlineDetector)
+	subManager, err := subscriptions.NewManager(config.DataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	chain := blockchain.NewBlockchain(config, db, txpool, appState, ipfsProxy, secStore, bus, offlineDetector, keyStore, subManager, upgrader)
+	proposals, pendingProofs := pengings.NewProposals(chain, appState, offlineDetector, upgrader)
 	flipper := flip.NewFlipper(db, ipfsProxy, flipKeyPool, txpool, secStore, appState, bus)
-	pm := protocol.NewIdenaGossipHandler(ipfsProxy.Host(), config.P2P, chain, proposals, votes, txpool, flipper, bus, flipKeyPool, appVersion)
+	pm := protocol.NewIdenaGossipHandler(ipfsProxy.Host(), config.P2P, chain, proposals, votes, txpool, flipper, bus, flipKeyPool, appVersion, &ceremonyChecker{
+		appState: appState,
+	})
 	sm := state.NewSnapshotManager(db, appState.State, bus, ipfsProxy, config)
-	downloader := protocol.NewDownloader(pm, config, chain, ipfsProxy, appState, sm, bus, secStore, statsCollector)
-	consensusEngine := consensus.NewEngine(chain, pm, proposals, config.Consensus, appState, votes, txpool, secStore,
-		downloader, offlineDetector, statsCollector)
+	downloader := protocol.NewDownloader(pm, config, chain, ipfsProxy, appState, sm, bus, secStore, statsCollector, subManager, keyStore, upgrader)
+	consensusEngine := consensus.NewEngine(chain, pm, proposals, config, appState, votes, txpool, secStore,
+		downloader, offlineDetector, upgrader, statsCollector)
 	ceremony := ceremony.NewValidationCeremony(appState, bus, flipper, secStore, db, txpool, chain, downloader, flipKeyPool, config)
 	profileManager := profile.NewProfileManager(ipfsProxy)
+
+	deferJob, err := deferredtx.NewJob(bus, config.DataDir, appState, chain, txpool, keyStore, secStore)
+	if err != nil {
+		return nil, err
+	}
+
 	node := &Node{
 		config:          config,
 		blockchain:      chain,
@@ -184,6 +216,9 @@ func NewNodeWithInjections(config *config.Config, bus eventbus.Bus, statsCollect
 		votes:           votes,
 		appVersion:      appVersion,
 		profileManager:  profileManager,
+		deferJob:        deferJob,
+		subManager:      subManager,
+		upgrader:        upgrader,
 	}
 	return &NodeCtx{
 		Node:            node,
@@ -193,8 +228,9 @@ func NewNodeWithInjections(config *config.Config, bus eventbus.Bus, statsCollect
 		Flipper:         flipper,
 		KeysPool:        flipKeyPool,
 		OfflineDetector: offlineDetector,
-		ProofsByRound:   proofsByRound,
 		PendingProofs:   pendingProofs,
+		ProposerByRound: proposals.ProposerByRound,
+		Upgrader:        upgrader,
 	}, nil
 }
 
@@ -203,7 +239,11 @@ func (node *Node) Start() {
 }
 
 func (node *Node) StartWithHeight(height uint64) {
-	node.secStore.AddKey(crypto.FromECDSA(node.config.NodeKey()))
+	if privateKey, err := node.config.NodeKey(); err != nil {
+		node.log.Crit("Cannot initialize node key", "error", err.Error())
+	} else {
+		node.secStore.AddKey(crypto.FromECDSA(privateKey))
+	}
 
 	if changed, value, err := util.ManageFdLimit(); changed {
 		node.log.Info("Set new fd limit", "value", value)
@@ -243,6 +283,7 @@ func (node *Node) StartWithHeight(height uint64) {
 	node.offlineDetector.Start(node.blockchain.Head)
 	node.consensusEngine.Start()
 	node.pm.Start()
+	node.upgrader.Start()
 
 	// Configure RPC
 	if err := node.startRPC(); err != nil {
@@ -347,12 +388,17 @@ func (node *Node) apis() []rpc.API {
 			Service:   api.NewBlockchainApi(baseApi, node.blockchain, node.ipfsProxy, node.txpool, node.downloader, node.pm),
 			Public:    true,
 		},
+		{
+			Namespace: "ipfs",
+			Version:   "1.0",
+			Service:   api.NewIpfsApi(node.ipfsProxy),
+			Public:    true,
+		},
+		{
+			Namespace: "contract",
+			Version:   "1.0",
+			Service:   api.NewContractApi(baseApi, node.blockchain, node.deferJob, node.subManager),
+			Public:    true,
+		},
 	}
-}
-
-func (node *Node) generateSyntheticP2PKey() *ecdsa.PrivateKey {
-	hash := common.Hash(rlp.Hash([]byte("node-p2p-key")))
-	sig := node.secStore.Sign(hash.Bytes())
-	p2pKey, _ := crypto.GenerateKeyFromSeed(bytes.NewReader(sig))
-	return p2pKey
 }

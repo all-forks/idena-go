@@ -11,13 +11,13 @@ import (
 	"github.com/idena-network/idena-go/core/appstate"
 	"github.com/idena-network/idena-go/events"
 	"github.com/idena-network/idena-go/log"
+	"github.com/idena-network/idena-go/stats/collector"
 	"github.com/pkg/errors"
 	"sort"
 	"sync"
 )
 
 const (
-	BlockBodySize  = 1024 * 1024
 	MaxDeferredTxs = 100
 )
 
@@ -35,6 +35,7 @@ var (
 type TransactionPool interface {
 	Add(tx *types.Transaction) error
 	GetPendingTransaction() []*types.Transaction
+	IsSyncing() bool
 }
 
 type TxPool struct {
@@ -52,9 +53,14 @@ type TxPool struct {
 	bus              eventbus.Bus
 	isSyncing        bool //indicates about blockchain's syncing
 	coinbase         common.Address
+	statsCollector   collector.StatsCollector
 }
 
-func NewTxPool(appState *appstate.AppState, bus eventbus.Bus, cfg *config.Mempool) *TxPool {
+func (pool *TxPool) IsSyncing() bool {
+	return pool.isSyncing
+}
+
+func NewTxPool(appState *appstate.AppState, bus eventbus.Bus, cfg *config.Mempool, statsCollector collector.StatsCollector) *TxPool {
 	pool := &TxPool{
 		all:              newTxMap(-1),
 		executableTxs:    make(map[common.Address]*sortedTxs),
@@ -65,6 +71,7 @@ func NewTxPool(appState *appstate.AppState, bus eventbus.Bus, cfg *config.Mempoo
 		appState:         appState,
 		log:              log.New(),
 		bus:              bus,
+		statsCollector:   statsCollector,
 	}
 
 	_ = pool.bus.Subscribe(events.AddBlockEventID,
@@ -172,8 +179,8 @@ func (pool *TxPool) checkRegularTxLimits(tx *types.Transaction) error {
 }
 
 func (pool *TxPool) validate(tx *types.Transaction, appState *appstate.AppState, txType validation.TxType) error {
-	minFeePerByte := fee.GetFeePerByteForNetwork(appState.ValidatorsCache.NetworkSize())
-	return validation.ValidateTx(appState, tx, minFeePerByte, txType)
+	minFeePerGas := fee.GetFeePerGasForNetwork(appState.ValidatorsCache.NetworkSize())
+	return validation.ValidateTx(appState, tx, minFeePerGas, txType)
 }
 
 func (pool *TxPool) AddTxs(txs []*types.Transaction) {
@@ -189,6 +196,15 @@ func (pool *TxPool) AddTxs(txs []*types.Transaction) {
 
 		if pool.isSyncing && sender != pool.coinbase {
 			pool.addDeferredTx(tx)
+
+			if _, ok := priorityTypes[tx.Type]; ok {
+				pool.bus.Publish(&events.NewTxEvent{
+					Tx:       tx,
+					Own:      sender == pool.coinbase,
+					Deferred: true,
+				})
+			}
+
 			continue
 		}
 
@@ -202,6 +218,14 @@ func (pool *TxPool) Add(tx *types.Transaction) error {
 
 	if pool.isSyncing && sender != pool.coinbase {
 		pool.addDeferredTx(tx)
+
+		if _, ok := priorityTypes[tx.Type]; ok {
+			pool.bus.Publish(&events.NewTxEvent{
+				Tx:       tx,
+				Own:      sender == pool.coinbase,
+				Deferred: true,
+			})
+		}
 		return nil
 	}
 
@@ -219,9 +243,9 @@ func (pool *TxPool) add(tx *types.Transaction, appState *appstate.AppState) erro
 	}
 
 	pool.mutex.Lock()
-	defer pool.mutex.Unlock()
 
 	if err := pool.checkLimits(tx); err != nil {
+		pool.mutex.Unlock()
 		log.Warn("Tx limits", "hash", tx.Hash().Hex(), "err", err)
 		return err
 	}
@@ -229,13 +253,26 @@ func (pool *TxPool) add(tx *types.Transaction, appState *appstate.AppState) erro
 	sender, _ := types.Sender(tx)
 
 	if err := pool.validate(tx, appState, validation.InboundTx); err != nil {
+		pool.mutex.Unlock()
 		if sender == pool.coinbase {
 			log.Warn("Tx is not valid", "hash", tx.Hash().Hex(), "err", err)
 		}
 		return err
 	}
 
-	return pool.put(tx)
+	err := pool.put(tx)
+	if err != nil {
+		pool.mutex.Unlock()
+		return err
+	}
+
+	pool.mutex.Unlock()
+
+	pool.bus.Publish(&events.NewTxEvent{
+		Tx:  tx,
+		Own: sender == pool.coinbase,
+	})
+	return nil
 }
 
 func (pool *TxPool) putToPending(tx *types.Transaction) error {
@@ -296,10 +333,6 @@ func (pool *TxPool) put(tx *types.Transaction) error {
 
 	pool.appState.NonceCache.SetNonce(sender, tx.Epoch, tx.AccountNonce)
 
-	pool.bus.Publish(&events.NewTxEvent{
-		Tx:  tx,
-		Own: sender == pool.coinbase,
-	})
 	return nil
 }
 
@@ -366,6 +399,8 @@ func (pool *TxPool) Remove(transaction *types.Transaction) {
 			delete(pool.pendingTxs, sender)
 		}
 	}
+
+	pool.statsCollector.RemoveMemPoolTx(transaction)
 }
 
 func (pool *TxPool) movePendingTxsToExecutable() {
@@ -435,14 +470,14 @@ func (pool *TxPool) ResetTo(block *types.Block) {
 
 	removingTxs := make(map[common.Hash]*types.Transaction)
 
-	minFeePerByte := fee.GetFeePerByteForNetwork(appState.ValidatorsCache.NetworkSize())
+	minFeePerGas := fee.GetFeePerGasForNetwork(appState.ValidatorsCache.NetworkSize())
 
 	for _, tx := range pending {
 		if tx.Epoch != globalEpoch {
 			continue
 		}
 
-		if err := validation.ValidateTx(appState, tx, minFeePerByte, validation.MempoolTx); err != nil {
+		if err := validation.ValidateTx(appState, tx, minFeePerGas, validation.MempoolTx); err != nil {
 			if errors.Cause(err) == validation.InvalidNonce {
 				removingTxs[tx.Hash()] = tx
 				continue

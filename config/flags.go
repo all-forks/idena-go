@@ -11,7 +11,7 @@ const (
 	DefaultIpfsPort         = 40405
 	DefaultGodAddress       = "0x4d60dc6a2cba8c3ef1ba5e1eba5c12c54cee6b61"
 	DefaultCeremonyTime     = int64(1567171800)
-	DefaultSwarmKey         = "9ad6f96bb2b02a7308ad87938d6139a974b550cc029ce416641a60c46db2f530"
+	DefaultSwarmKey         = "00d6f96bb2b02a7308ad87938d6139a974b555cc029ce416641a60c46db2f531"
 	DefaultForceFullSync    = 100
 	DefaultStoreCertRange   = 2000
 	DefaultMaxInboundPeers  = 12
@@ -24,12 +24,10 @@ const (
 
 var (
 	DefaultIpfsBootstrapNodes = []string{
-		"/ip4/206.81.23.186/tcp/40403/ipfs/QmTHDLnNMAp6K8txLmJW6EHUbwoHTGhkEUBCp4gAtpNqKY",
+		"/ip4/64.227.41.45/tcp/40405/ipfs/QmfJktBd2jf37Jx3eCYyn1fofbW511U5XvYiMp7233mLZM",
+		"/ip4/135.181.40.10/tcp/40405/ipfs/QmNYWtiwM1UfeCmHfWSdefrMuQdg6nycY5yS64HYqWCUhD",
 		"/ip4/165.227.91.202/tcp/40403/ipfs/QmZ9VnVZsokXEttRYiHbHmCUBSdzSQywjj5wM3Me96XoVD",
-		"/ip4/167.172.106.202/tcp/40405/ipfs/Qma1F1LXHGA1RLuBDN66nuZE8Pm1249UTX7Q6CbhFnfTG2",
-		"/ip4/104.248.248.29/tcp/40405/ipfs/QmTzKWYksgjm8aecWAJC5pAMidkhWjj86R9MdGA8dVJxQc",
 		"/ip4/161.35.18.60/tcp/40405/ipfs/QmaBWm6dXsc6Y1MZ1x4ZTqHdjy32PGmyGmNPmHnxGGgrXF",
-		"/ip4/35.184.126.97/tcp/40405/ipfs/QmYEM7yPRHBUyzNJvdL34ut2uyJSAk66AeZXzu3Cftofec",
 	}
 	CfgFileFlag = cli.StringFlag{
 		Name:  "config",
@@ -111,7 +109,7 @@ var (
 	LogFileSizeFlag = cli.IntFlag{
 		Name:  "logfilesize",
 		Usage: "Set log file size in KB",
-		Value: 1024 * 10,
+		Value: 1024 * 100,
 	}
 	LogColoring = cli.BoolFlag{
 		Name:  "logcoloring",

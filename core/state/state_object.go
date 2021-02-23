@@ -2,11 +2,11 @@ package state
 
 import (
 	"bytes"
+	"github.com/golang/protobuf/proto"
 	"github.com/idena-network/idena-go/blockchain/types"
 	"github.com/idena-network/idena-go/common"
 	"github.com/idena-network/idena-go/common/math"
-	"github.com/idena-network/idena-go/rlp"
-	"io"
+	models "github.com/idena-network/idena-go/protobuf"
 	math2 "math"
 	"math/big"
 )
@@ -29,6 +29,9 @@ const (
 
 	AdditionalVerifiedFlips = 1
 	AdditionalHumanFlips    = 2
+
+	// Minimal number of blocks in after long period which should be without ceremonial txs
+	AfterLongRequiredBlocks = 5
 )
 
 func (s IdentityState) NewbieOrBetter() bool {
@@ -60,6 +63,7 @@ type stateIdentity struct {
 	deleted bool
 	onDirty func(addr common.Address) // Callback method to mark a state object newly dirty
 }
+
 type stateApprovedIdentity struct {
 	address common.Address
 	data    ApprovedIdentity
@@ -67,14 +71,17 @@ type stateApprovedIdentity struct {
 	deleted bool
 	onDirty func(addr common.Address) // Callback method to mark a state object newly dirty
 }
+
 type stateGlobal struct {
 	data Global
 
 	onDirty func() // Callback method to mark a state object newly dirty
 }
+
 type stateStatusSwitch struct {
 	data IdentityStatusSwitch
 
+	deleted bool
 	onDirty func()
 }
 
@@ -92,26 +99,125 @@ type IdentityStatusSwitch struct {
 	Addresses []common.Address `rlp:"nil"`
 }
 
+func (s *IdentityStatusSwitch) ToBytes() ([]byte, error) {
+	protoObj := new(models.ProtoStateIdentityStatusSwitch)
+	for idx := range s.Addresses {
+		protoObj.Addresses = append(protoObj.Addresses, s.Addresses[idx][:])
+	}
+	return proto.Marshal(protoObj)
+}
+
+func (s *IdentityStatusSwitch) FromBytes(data []byte) error {
+	protoObj := new(models.ProtoStateIdentityStatusSwitch)
+	if err := proto.Unmarshal(data, protoObj); err != nil {
+		return err
+	}
+	for idx := range protoObj.Addresses {
+		s.Addresses = append(s.Addresses, common.BytesToAddress(protoObj.Addresses[idx]))
+	}
+	return nil
+}
+
 type Global struct {
-	Epoch                uint16
-	NextValidationTime   *big.Int
-	ValidationPeriod     ValidationPeriod
-	GodAddress           common.Address
-	WordsSeed            types.Seed `rlp:"nil"`
-	LastSnapshot         uint64
-	EpochBlock           uint64
-	FeePerByte           *big.Int
-	VrfProposerThreshold uint64
-	EmptyBlocksBits      *big.Int
-	GodAddressInvites    uint16
+	Epoch                         uint16
+	NextValidationTime            int64
+	ValidationPeriod              ValidationPeriod
+	GodAddress                    common.Address
+	WordsSeed                     types.Seed `rlp:"nil"`
+	LastSnapshot                  uint64
+	EpochBlock                    uint64
+	FeePerGas                     *big.Int
+	VrfProposerThreshold          uint64
+	EmptyBlocksBits               *big.Int
+	GodAddressInvites             uint16
+	BlocksCntWithoutCeremonialTxs byte
+}
+
+func (s *Global) ToBytes() ([]byte, error) {
+	protoAnswer := &models.ProtoStateGlobal{
+		Epoch:                         uint32(s.Epoch),
+		NextValidationTime:            s.NextValidationTime,
+		ValidationPeriod:              uint32(s.ValidationPeriod),
+		GodAddress:                    s.GodAddress[:],
+		WordsSeed:                     s.WordsSeed[:],
+		LastSnapshot:                  s.LastSnapshot,
+		EpochBlock:                    s.EpochBlock,
+		FeePerGas:                    common.BigIntBytesOrNil(s.FeePerGas),
+		VrfProposerThreshold:          s.VrfProposerThreshold,
+		EmptyBlocksBits:               common.BigIntBytesOrNil(s.EmptyBlocksBits),
+		GodAddressInvites:             uint32(s.GodAddressInvites),
+		BlocksCntWithoutCeremonialTxs: uint32(s.BlocksCntWithoutCeremonialTxs),
+	}
+	return proto.Marshal(protoAnswer)
+}
+
+func (s *Global) FromBytes(data []byte) error {
+	protoGlobal := new(models.ProtoStateGlobal)
+	if err := proto.Unmarshal(data, protoGlobal); err != nil {
+		return err
+	}
+
+	s.Epoch = uint16(protoGlobal.Epoch)
+	s.NextValidationTime = protoGlobal.NextValidationTime
+	s.ValidationPeriod = ValidationPeriod(protoGlobal.ValidationPeriod)
+	s.GodAddress = common.BytesToAddress(protoGlobal.GodAddress)
+	s.WordsSeed = types.BytesToSeed(protoGlobal.WordsSeed)
+	s.LastSnapshot = protoGlobal.LastSnapshot
+	s.EpochBlock = protoGlobal.EpochBlock
+	s.FeePerGas = common.BigIntOrNil(protoGlobal.FeePerGas)
+	s.VrfProposerThreshold = protoGlobal.VrfProposerThreshold
+	s.EmptyBlocksBits = common.BigIntOrNil(protoGlobal.EmptyBlocksBits)
+	s.GodAddressInvites = uint16(protoGlobal.GodAddressInvites)
+	s.BlocksCntWithoutCeremonialTxs = byte(protoGlobal.BlocksCntWithoutCeremonialTxs)
+	return nil
 }
 
 // Account is the Idena consensus representation of accounts.
 // These objects are stored in the main account trie.
 type Account struct {
-	Nonce   uint32
-	Epoch   uint16
-	Balance *big.Int
+	Nonce    uint32
+	Epoch    uint16
+	Balance  *big.Int
+	Contract *ContractData
+}
+
+type ContractData struct {
+	CodeHash common.Hash
+	Stake    *big.Int
+}
+
+func (a *Account) ToBytes() ([]byte, error) {
+	protoAcc := &models.ProtoStateAccount{
+		Nonce:   a.Nonce,
+		Epoch:   uint32(a.Epoch),
+		Balance: common.BigIntBytesOrNil(a.Balance),
+	}
+	if a.Contract != nil {
+		protoAcc.ContractData = &models.ProtoStateAccount_ProtoContractData{
+			CodeHash: a.Contract.CodeHash.Bytes(),
+			Stake:    common.BigIntBytesOrNil(a.Contract.Stake),
+		}
+	}
+	return proto.Marshal(protoAcc)
+}
+
+func (a *Account) FromBytes(data []byte) error {
+	protoAcc := new(models.ProtoStateAccount)
+	if err := proto.Unmarshal(data, protoAcc); err != nil {
+		return err
+	}
+	a.Balance = common.BigIntOrNil(protoAcc.Balance)
+	a.Epoch = uint16(protoAcc.Epoch)
+	a.Nonce = protoAcc.Nonce
+	if protoAcc.ContractData != nil {
+		hash := common.Hash{}
+		hash.SetBytes(protoAcc.ContractData.CodeHash)
+		a.Contract = &ContractData{
+			CodeHash: hash,
+			Stake:    common.BigIntOrNil(protoAcc.ContractData.Stake),
+		}
+	}
+	return nil
 }
 
 type IdentityFlip struct {
@@ -128,7 +234,7 @@ const (
 )
 
 type Identity struct {
-	ProfileHash    []byte `rlp:"nil"`
+	ProfileHash    []byte
 	Stake          *big.Int
 	Invites        uint8
 	Birthday       uint16
@@ -136,16 +242,17 @@ type Identity struct {
 	QualifiedFlips uint32
 	// should use GetShortFlipPoints instead of reading directly
 	ShortFlipPoints      uint32
-	PubKey               []byte `rlp:"nil"`
+	PubKey               []byte
 	RequiredFlips        uint8
-	Flips                []IdentityFlip `rlp:"nil"`
+	Flips                []IdentityFlip
 	Generation           uint32
-	Code                 []byte   `rlp:"nil"`
-	Invitees             []TxAddr `rlp:"nil"`
-	Inviter              *TxAddr  `rlp:"nil"`
+	Code                 []byte
+	Invitees             []TxAddr
+	Inviter              *TxAddr
 	Penalty              *big.Int
 	ValidationTxsBits    byte
 	LastValidationStatus ValidationStatusFlag
+	Scores               []byte
 }
 
 type TxAddr struct {
@@ -153,15 +260,92 @@ type TxAddr struct {
 	Address common.Address
 }
 
-func (i *Identity) GetShortFlipPoints() float32 {
-	return float32(i.ShortFlipPoints) / 2
+func (i *Identity) ToBytes() ([]byte, error) {
+	protoIdentity := &models.ProtoStateIdentity{
+		Stake:            common.BigIntBytesOrNil(i.Stake),
+		Invites:          uint32(i.Invites),
+		Birthday:         uint32(i.Birthday),
+		State:            uint32(i.State),
+		QualifiedFlips:   i.QualifiedFlips,
+		ShortFlipPoints:  i.ShortFlipPoints,
+		PubKey:           i.PubKey,
+		RequiredFlips:    uint32(i.RequiredFlips),
+		Generation:       i.Generation,
+		Code:             i.Code,
+		Penalty:          common.BigIntBytesOrNil(i.Penalty),
+		ValidationBits:   uint32(i.ValidationTxsBits),
+		ValidationStatus: uint32(i.LastValidationStatus),
+		ProfileHash:      i.ProfileHash,
+		Scores:           i.Scores,
+	}
+	for idx := range i.Flips {
+		protoIdentity.Flips = append(protoIdentity.Flips, &models.ProtoStateIdentity_Flip{
+			Cid:  i.Flips[idx].Cid,
+			Pair: uint32(i.Flips[idx].Pair),
+		})
+	}
+	for idx := range i.Invitees {
+		protoIdentity.Invitees = append(protoIdentity.Invitees, &models.ProtoStateIdentity_TxAddr{
+			Hash:    i.Invitees[idx].TxHash[:],
+			Address: i.Invitees[idx].Address[:],
+		})
+	}
+	if i.Inviter != nil {
+		protoIdentity.Inviter = &models.ProtoStateIdentity_TxAddr{
+			Hash:    i.Inviter.TxHash[:],
+			Address: i.Inviter.Address[:],
+		}
+	}
+	return proto.Marshal(protoIdentity)
 }
 
-func (i *Identity) GetTotalScore() float32 {
-	if i.QualifiedFlips == 0 {
-		return 0
+func (i *Identity) FromBytes(data []byte) error {
+	protoIdentity := new(models.ProtoStateIdentity)
+	if err := proto.Unmarshal(data, protoIdentity); err != nil {
+		return err
 	}
-	return i.GetShortFlipPoints() / float32(i.QualifiedFlips)
+	i.Stake = common.BigIntOrNil(protoIdentity.Stake)
+	i.Invites = uint8(protoIdentity.Invites)
+	i.Birthday = uint16(protoIdentity.Birthday)
+	i.State = IdentityState(protoIdentity.State)
+	i.QualifiedFlips = protoIdentity.QualifiedFlips
+	i.ShortFlipPoints = protoIdentity.ShortFlipPoints
+	i.PubKey = protoIdentity.PubKey
+	i.RequiredFlips = uint8(protoIdentity.RequiredFlips)
+	i.Generation = protoIdentity.Generation
+	i.Code = protoIdentity.Code
+	i.Penalty = common.BigIntOrNil(protoIdentity.Penalty)
+	i.ValidationTxsBits = byte(protoIdentity.ValidationBits)
+	i.LastValidationStatus = ValidationStatusFlag(protoIdentity.ValidationStatus)
+	i.ProfileHash = protoIdentity.ProfileHash
+	i.Scores = protoIdentity.Scores
+
+	for idx := range protoIdentity.Flips {
+		i.Flips = append(i.Flips, IdentityFlip{
+			Cid:  protoIdentity.Flips[idx].Cid,
+			Pair: uint8(protoIdentity.Flips[idx].Pair),
+		})
+	}
+
+	for idx := range protoIdentity.Invitees {
+		i.Invitees = append(i.Invitees, TxAddr{
+			TxHash:  common.BytesToHash(protoIdentity.Invitees[idx].Hash),
+			Address: common.BytesToAddress(protoIdentity.Invitees[idx].Address),
+		})
+	}
+
+	if protoIdentity.Inviter != nil {
+		i.Inviter = &TxAddr{
+			TxHash:  common.BytesToHash(protoIdentity.Inviter.Hash),
+			Address: common.BytesToAddress(protoIdentity.Inviter.Address),
+		}
+	}
+
+	return nil
+}
+
+func (i *Identity) GetShortFlipPoints() float32 {
+	return float32(i.ShortFlipPoints) / 2
 }
 
 func (i *Identity) HasDoneAllRequiredFlips() bool {
@@ -185,6 +369,24 @@ func (i *Identity) GetMaximumAvailableFlips() uint8 {
 type ApprovedIdentity struct {
 	Approved bool
 	Online   bool
+}
+
+func (s *ApprovedIdentity) ToBytes() ([]byte, error) {
+	protoAnswer := &models.ProtoStateApprovedIdentity{
+		Approved: s.Approved,
+		Online:   s.Online,
+	}
+	return proto.Marshal(protoAnswer)
+}
+
+func (s *ApprovedIdentity) FromBytes(data []byte) error {
+	protoIdentity := new(models.ProtoStateApprovedIdentity)
+	if err := proto.Unmarshal(data, protoIdentity); err != nil {
+		return err
+	}
+	s.Approved = protoIdentity.Approved
+	s.Online = protoIdentity.Online
+	return nil
 }
 
 // newAccountObject creates a state object.
@@ -233,11 +435,6 @@ func newApprovedIdentityObject(address common.Address, data ApprovedIdentity, on
 	}
 }
 
-// EncodeRLP implements rlp.Encoder.
-func (s *stateAccount) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, s.data)
-}
-
 func (s *stateAccount) touch() {
 	if s.onDirty != nil {
 		s.onDirty(s.Address())
@@ -272,10 +469,6 @@ func (s *stateAccount) SetBalance(amount *big.Int) {
 }
 
 func (s *stateAccount) setBalance(amount *big.Int) {
-
-	if s.data.Balance == nil {
-		s.data.Balance = new(big.Int)
-	}
 	s.data.Balance = amount
 	s.touch()
 }
@@ -288,7 +481,7 @@ func (s *stateAccount) deepCopy(db *StateDB, onDirty func(addr common.Address)) 
 
 // empty returns whether the account is considered empty.
 func (s *stateAccount) empty() bool {
-	return s.data.Balance.Sign() == 0 && s.data.Nonce == 0
+	return s.Balance().Sign() == 0 && s.data.Nonce == 0 && s.data.Contract == nil
 }
 
 // Returns the address of the contract/account
@@ -315,7 +508,6 @@ func (s *stateAccount) setEpoch(nonce uint16) {
 }
 
 func (s *stateAccount) Balance() *big.Int {
-
 	if s.data.Balance == nil {
 		return big.NewInt(0)
 	}
@@ -328,6 +520,22 @@ func (s *stateAccount) Nonce() uint32 {
 
 func (s *stateAccount) Epoch() uint16 {
 	return s.data.Epoch
+}
+
+func (s *stateAccount) SetCodeHash(hash common.Hash) {
+	if s.data.Contract == nil {
+		s.data.Contract = &ContractData{}
+	}
+	s.data.Contract.CodeHash = hash
+	s.touch()
+}
+
+func (s *stateAccount) SetContractStake(stake *big.Int) {
+	if s.data.Contract == nil {
+		s.data.Contract = &ContractData{}
+	}
+	s.data.Contract.Stake = stake
+	s.touch()
 }
 
 // Returns the address of the contract/account
@@ -381,15 +589,11 @@ func (s *stateIdentity) GeneticCode() (generation uint32, code []byte) {
 
 func (s *stateIdentity) Stake() *big.Int {
 	if s.data.Stake == nil {
-		return big.NewInt(0)
+		return common.Big0
 	}
 	return s.data.Stake
 }
 
-// EncodeRLP implements rlp.Encoder.
-func (s *stateIdentity) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, s.data)
-}
 func (s *stateIdentity) AddStake(amount *big.Int) {
 	if amount.Sign() == 0 {
 		if s.empty() {
@@ -412,10 +616,6 @@ func (s *stateIdentity) SubStake(amount *big.Int) {
 }
 
 func (s *stateIdentity) SetStake(amount *big.Int) {
-	if s.data.Stake == nil {
-		s.data.Stake = new(big.Int)
-	}
-
 	s.data.Stake = amount
 	s.touch()
 }
@@ -426,6 +626,7 @@ func (s *stateIdentity) AddInvite(i uint8) {
 	}
 	s.SetInvites(s.Invites() + i)
 }
+
 func (s *stateIdentity) SubInvite(i uint8) {
 	s.SetInvites(s.Invites() - i)
 }
@@ -435,18 +636,22 @@ func (s *stateIdentity) SetPubKey(pubKey []byte) {
 	s.touch()
 }
 
-func (s *stateIdentity) AddQualifiedFlipsCount(qualifiedFlips uint32) {
-	s.data.QualifiedFlips += qualifiedFlips
-	s.touch()
-}
-
 func (s *stateIdentity) QualifiedFlipsCount() uint32 {
 	return s.data.QualifiedFlips
 }
 
-func (s *stateIdentity) AddShortFlipPoints(flipPoints float32) {
-	s.data.ShortFlipPoints += uint32(flipPoints * 2)
+func (s *stateIdentity) AddNewScore(score byte) {
+	if len(s.data.Scores) == common.LastScoresCount {
+		s.data.Scores = append(s.data.Scores[1:], score)
+	} else {
+		s.data.Scores = append(s.data.Scores, score)
+	}
+
 	s.touch()
+}
+
+func (s *stateIdentity) Scores() []byte {
+	return s.data.Scores
 }
 
 func (s *stateIdentity) ShortFlipPoints() float32 {
@@ -549,16 +754,19 @@ func (s *stateIdentity) SubPenalty(amount *big.Int) {
 	if amount.Sign() == 0 {
 		return
 	}
-	p := s.data.Penalty
+	p := s.GetPenalty()
 
 	if p.Cmp(amount) <= 0 {
 		s.SetPenalty(nil)
 	} else {
-		s.SetPenalty(new(big.Int).Sub(s.data.Penalty, amount))
+		s.SetPenalty(new(big.Int).Sub(p, amount))
 	}
 }
 
 func (s *stateIdentity) GetPenalty() *big.Int {
+	if s.data.Penalty == nil {
+		return new(big.Int)
+	}
 	return s.data.Penalty
 }
 
@@ -598,11 +806,6 @@ func (s *stateIdentity) SetValidationStatus(status ValidationStatusFlag) {
 	s.touch()
 }
 
-// EncodeRLP implements rlp.Encoder.
-func (s *stateGlobal) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, s.data)
-}
-
 func (s *stateGlobal) Epoch() uint16 {
 	return s.data.Epoch
 }
@@ -638,9 +841,10 @@ func (s *stateGlobal) AddBlockBit(empty bool) {
 }
 
 func (s *stateGlobal) EmptyBlocksCount() int {
+	bits := s.EmptyBlocksBits()
 	cnt := 0
 	for i := 0; i < EmptyBlocksBitsSize; i++ {
-		if s.data.EmptyBlocksBits.Bit(i) == 0 {
+		if bits.Bit(i) == 0 {
 			cnt++
 		}
 	}
@@ -648,6 +852,9 @@ func (s *stateGlobal) EmptyBlocksCount() int {
 }
 
 func (s *stateGlobal) EmptyBlocksBits() *big.Int {
+	if s.data.EmptyBlocksBits == nil {
+		return new(big.Int)
+	}
 	return s.data.EmptyBlocksBits
 }
 
@@ -670,12 +877,12 @@ func (s *stateGlobal) touch() {
 	}
 }
 
-func (s *stateGlobal) NextValidationTime() *big.Int {
+func (s *stateGlobal) NextValidationTime() int64 {
 	return s.data.NextValidationTime
 }
 
 func (s *stateGlobal) SetNextValidationTime(unix int64) {
-	s.data.NextValidationTime = big.NewInt(unix)
+	s.data.NextValidationTime = unix
 	s.touch()
 }
 
@@ -716,13 +923,16 @@ func (s *stateGlobal) EpochBlock() uint64 {
 	return s.data.EpochBlock
 }
 
-func (s *stateGlobal) SetFeePerByte(fee *big.Int) {
-	s.data.FeePerByte = fee
+func (s *stateGlobal) SetFeePerGas(fee *big.Int) {
+	s.data.FeePerGas = fee
 	s.touch()
 }
 
-func (s *stateGlobal) FeePerByte() *big.Int {
-	return s.data.FeePerByte
+func (s *stateGlobal) FeePerGas() *big.Int {
+	if s.data.FeePerGas == nil {
+		return new(big.Int)
+	}
+	return s.data.FeePerGas
 }
 
 func (s *stateGlobal) SubGodAddressInvite() {
@@ -739,9 +949,18 @@ func (s *stateGlobal) SetGodAddressInvites(count uint16) {
 	s.touch()
 }
 
-// EncodeRLP implements rlp.Encoder.
-func (s *stateApprovedIdentity) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, s.data)
+func (s *stateGlobal) BlocksCntWithoutCeremonialTxs() byte {
+	return s.data.BlocksCntWithoutCeremonialTxs
+}
+
+func (s *stateGlobal) IncBlocksCntWithoutCeremonialTxs() {
+	s.data.BlocksCntWithoutCeremonialTxs++
+	s.touch()
+}
+
+func (s *stateGlobal) ResetBlocksCntWithoutCeremonialTxs() {
+	s.data.BlocksCntWithoutCeremonialTxs = 0
+	s.touch()
 }
 
 func (s *stateApprovedIdentity) Address() common.Address {
@@ -780,9 +999,8 @@ func IsCeremonyCandidate(identity Identity) bool {
 		state == Zombie) && identity.HasDoneAllRequiredFlips()
 }
 
-// EncodeRLP implements rlp.Encoder.
-func (s *stateStatusSwitch) EncodeRLP(w io.Writer) error {
-	return rlp.Encode(w, s.data)
+func (s *stateStatusSwitch) empty() bool {
+	return len(s.data.Addresses) == 0
 }
 
 func (s *stateStatusSwitch) Addresses() []common.Address {
@@ -790,7 +1008,7 @@ func (s *stateStatusSwitch) Addresses() []common.Address {
 }
 
 func (s *stateStatusSwitch) Clear() {
-	s.data.Addresses = nil
+	s.data.Addresses = []common.Address{}
 	s.touch()
 }
 
@@ -822,4 +1040,9 @@ func (s *stateStatusSwitch) touch() {
 
 func (f ValidationStatusFlag) HasFlag(flag ValidationStatusFlag) bool {
 	return f&flag != 0
+}
+
+type contractStoreValue struct {
+	value   []byte
+	removed bool
 }
